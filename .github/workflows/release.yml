@@ -4,58 +4,94 @@ on:
   push:
     tags:
       - 'v*'
+      - 'seance-v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., v0.1.0)'
+        description: 'Version to release (e.g., v0.1.0 or seance-v0.1.0)'
         required: true
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - os: macos-latest
-            target: aarch64-macos
+          # mitt
+          - app: mitt
+            os: macos-latest
             zig_target: aarch64-macos
             artifact: mitt-macos-aarch64
-          - os: macos-latest
-            target: x86_64-macos
+          - app: mitt
+            os: macos-latest
             zig_target: x86_64-macos
             artifact: mitt-macos-x86_64
-          - os: ubuntu-latest
-            target: x86_64-linux
+          - app: mitt
+            os: ubuntu-latest
             zig_target: x86_64-linux
             artifact: mitt-linux-x86_64
-          - os: ubuntu-latest
-            target: aarch64-linux
+          - app: mitt
+            os: ubuntu-latest
             zig_target: aarch64-linux
             artifact: mitt-linux-aarch64
+          # seance
+          - app: seance
+            os: macos-latest
+            zig_target: aarch64-macos
+            artifact: seance-macos-aarch64
+          - app: seance
+            os: macos-latest
+            zig_target: x86_64-macos
+            artifact: seance-macos-x86_64
+          - app: seance
+            os: ubuntu-latest
+            zig_target: x86_64-linux
+            artifact: seance-linux-x86_64
+          - app: seance
+            os: ubuntu-latest
+            zig_target: aarch64-linux
+            artifact: seance-linux-aarch64
 
     steps:
+      - name: Check if this app should build
+        id: check
+        run: |
+          TAG="${{ github.ref_name }}"
+          APP="${{ matrix.app }}"
+          if [[ "$TAG" == seance-v* && "$APP" == "seance" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == v* && ! "$TAG" == seance-v* && "$APP" == "mitt" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Checkout code
+        if: steps.check.outputs.should_build == 'true'
         uses: actions/checkout@v4
 
       - name: Setup Zig
+        if: steps.check.outputs.should_build == 'true'
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.15.2
 
-      - name: Build mitt
-        run: |
-          zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+      - name: Build
+        if: steps.check.outputs.should_build == 'true'
+        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
 
       - name: Package binary
+        if: steps.check.outputs.should_build == 'true'
         run: |
           mkdir -p dist
-          cp zig-out/bin/mitt dist/
+          cp zig-out/bin/${{ matrix.app }} dist/
           cd dist
-          tar -czf ${{ matrix.artifact }}.tar.gz mitt
-          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          tar -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.app }}
+          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256 2>/dev/null || shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Upload artifact
+        if: steps.check.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -82,12 +118,42 @@ jobs:
         with:
           path: artifacts
 
-      - name: Display structure of downloaded files
-        run: ls -R artifacts
+      - name: Determine app from tag
+        id: app
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" == seance-v* ]]; then
+            echo "name=seance" >> $GITHUB_OUTPUT
+            echo "version=${TAG#seance-}" >> $GITHUB_OUTPUT
+          else
+            echo "name=mitt" >> $GITHUB_OUTPUT
+            echo "version=$TAG" >> $GITHUB_OUTPUT
+          fi
 
       - name: Create release notes
         run: |
-          cat > release_notes.md << 'EOF'
+          APP="${{ steps.app.outputs.name }}"
+          if [ "$APP" = "seance" ]; then
+            cat > release_notes.md << 'EOF'
+          # seance ${{ github.ref_name }}
+
+          Ephemeral encrypted P2P group chat. No accounts, no history, no cloud.
+
+          ## Installation
+
+          ### Homebrew (macOS/Linux)
+          ```bash
+          brew tap no-way-labs/cauldron
+          brew install seance
+          ```
+
+          ### Manual Installation
+          Download the appropriate binary for your platform below and extract it.
+
+          ## SHA256 Checksums
+          EOF
+          else
+            cat > release_notes.md << 'EOF'
           # mitt ${{ github.ref_name }}
 
           An encrypted file transfer CLI tool.
@@ -105,9 +171,10 @@ jobs:
 
           ## SHA256 Checksums
           EOF
+          fi
 
           for file in artifacts/*/*.sha256; do
-            cat "$file" >> release_notes.md
+            [ -f "$file" ] && cat "$file" >> release_notes.md
           done
 
       - name: Create Release
@@ -120,30 +187,42 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract SHA256 values and update formula
+      - name: Update Homebrew formula
         run: |
-          ARM64_SHA=$(cat artifacts/mitt-macos-aarch64/*.sha256 | awk '{print $1}')
-          X86_64_SHA=$(cat artifacts/mitt-macos-x86_64/*.sha256 | awk '{print $1}')
-          LINUX_ARM64_SHA=$(cat artifacts/mitt-linux-aarch64/*.sha256 | awk '{print $1}')
-          LINUX_X86_64_SHA=$(cat artifacts/mitt-linux-x86_64/*.sha256 | awk '{print $1}')
-          VERSION=${GITHUB_REF#refs/tags/}
+          APP="${{ steps.app.outputs.name }}"
+          TAG="${{ github.ref_name }}"
+          VERSION="${{ steps.app.outputs.version }}"
 
-          # Update version
-          sed -i "s/version \".*\"/version \"${VERSION#v}\"/" Formula/mitt.rb
+          if [ "$APP" = "seance" ]; then
+            ARM64_SHA=$(cat artifacts/seance-macos-aarch64/*.sha256 | awk '{print $1}')
+            X86_64_SHA=$(cat artifacts/seance-macos-x86_64/*.sha256 | awk '{print $1}')
+            LINUX_ARM64_SHA=$(cat artifacts/seance-linux-aarch64/*.sha256 | awk '{print $1}')
+            LINUX_X86_64_SHA=$(cat artifacts/seance-linux-x86_64/*.sha256 | awk '{print $1}')
 
-          # Update URLs to new version
-          sed -i "s|download/v[0-9.]\+/|download/$VERSION/|g" Formula/mitt.rb
+            sed -i "s/version \".*\"/version \"${VERSION#v}\"/" Formula/seance.rb
+            sed -i "s|download/seance-v[0-9.]*\/|download/$TAG/|g" Formula/seance.rb
+            sed -i "/seance-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/seance.rb
+            sed -i "/seance-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" Formula/seance.rb
+            sed -i "/seance-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" Formula/seance.rb
+            sed -i "/seance-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" Formula/seance.rb
+          else
+            ARM64_SHA=$(cat artifacts/mitt-macos-aarch64/*.sha256 | awk '{print $1}')
+            X86_64_SHA=$(cat artifacts/mitt-macos-x86_64/*.sha256 | awk '{print $1}')
+            LINUX_ARM64_SHA=$(cat artifacts/mitt-linux-aarch64/*.sha256 | awk '{print $1}')
+            LINUX_X86_64_SHA=$(cat artifacts/mitt-linux-x86_64/*.sha256 | awk '{print $1}')
 
-          # Update SHA256 checksums
-          sed -i "/mitt-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/mitt.rb
-          sed -i "/mitt-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" Formula/mitt.rb
-          sed -i "/mitt-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" Formula/mitt.rb
-          sed -i "/mitt-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" Formula/mitt.rb
+            sed -i "s/version \".*\"/version \"${VERSION#v}\"/" Formula/mitt.rb
+            sed -i "s|download/v[0-9.]*\/|download/$VERSION/|g" Formula/mitt.rb
+            sed -i "/mitt-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/mitt.rb
+            sed -i "/mitt-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" Formula/mitt.rb
+            sed -i "/mitt-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" Formula/mitt.rb
+            sed -i "/mitt-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" Formula/mitt.rb
+          fi
 
       - name: Commit updated formula
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/mitt.rb
+          git add Formula/
           git commit -m "Update Homebrew formula for ${{ github.ref_name }}"
           git push origin HEAD:main
