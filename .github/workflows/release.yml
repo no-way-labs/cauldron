@@ -96,7 +96,7 @@ jobs:
 
           ### Homebrew (macOS/Linux)
           ```bash
-          brew tap no-way-labs/caldron
+          brew tap no-way-labs/cauldron
           brew install mitt
           ```
 

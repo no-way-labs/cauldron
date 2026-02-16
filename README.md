@@ -1,11 +1,11 @@
-# Caldron
+# Cauldron
 
 A monorepo for various CLI applications written in Zig.
 
 ## Structure
 
 ```
-caldron/
+cauldron/
 ├── apps/
 │   └── mitt/            # Encrypted file transfer CLI
 │       ├── src/
@@ -25,13 +25,13 @@ caldron/
 Install mitt via Homebrew:
 
 ```bash
-brew tap no-way-labs/caldron
+brew tap no-way-labs/cauldron
 brew install mitt
 ```
 
 ### From Source
 
-Install all CLI apps to `~/.local/bin` with the `caldron-` prefix:
+Install all CLI apps to `~/.local/bin` with the `cauldron-` prefix:
 
 ```bash
 ./install.sh

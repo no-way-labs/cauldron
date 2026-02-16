@@ -42,7 +42,7 @@ Use this checklist when preparing and publishing a new release.
 
 ## Post-Release Verification
 
-- [ ] Verify GitHub Release at https://github.com/no-way-labs/caldron/releases/latest
+- [ ] Verify GitHub Release at https://github.com/no-way-labs/cauldron/releases/latest
   - [ ] All 4 tar.gz files are present (macOS arm64/x86_64, Linux arm64/x86_64)
   - [ ] SHA256 checksums are in release notes
   - [ ] Release notes are correct
@@ -70,16 +70,16 @@ If the GitHub Actions workflow failed to update the formula:
 1. Download and calculate SHA256s:
    ```bash
    cd /tmp
-   curl -sL https://github.com/no-way-labs/caldron/releases/download/v0.X.Y/mitt-macos-aarch64.tar.gz -o mitt-macos-aarch64.tar.gz
+   curl -sL https://github.com/no-way-labs/cauldron/releases/download/v0.X.Y/mitt-macos-aarch64.tar.gz -o mitt-macos-aarch64.tar.gz
    shasum -a 256 mitt-macos-aarch64.tar.gz
 
-   curl -sL https://github.com/no-way-labs/caldron/releases/download/v0.X.Y/mitt-macos-x86_64.tar.gz -o mitt-macos-x86_64.tar.gz
+   curl -sL https://github.com/no-way-labs/cauldron/releases/download/v0.X.Y/mitt-macos-x86_64.tar.gz -o mitt-macos-x86_64.tar.gz
    shasum -a 256 mitt-macos-x86_64.tar.gz
 
-   curl -sL https://github.com/no-way-labs/caldron/releases/download/v0.X.Y/mitt-linux-aarch64.tar.gz -o mitt-linux-aarch64.tar.gz
+   curl -sL https://github.com/no-way-labs/cauldron/releases/download/v0.X.Y/mitt-linux-aarch64.tar.gz -o mitt-linux-aarch64.tar.gz
    shasum -a 256 mitt-linux-aarch64.tar.gz
 
-   curl -sL https://github.com/no-way-labs/caldron/releases/download/v0.X.Y/mitt-linux-x86_64.tar.gz -o mitt-linux-x86_64.tar.gz
+   curl -sL https://github.com/no-way-labs/cauldron/releases/download/v0.X.Y/mitt-linux-x86_64.tar.gz -o mitt-linux-x86_64.tar.gz
    shasum -a 256 mitt-linux-x86_64.tar.gz
    ```
 
@@ -99,7 +99,7 @@ If the GitHub Actions workflow failed to update the formula:
 
 ### Workflow Failures
 
-- Check GitHub Actions logs at https://github.com/no-way-labs/caldron/actions
+- Check GitHub Actions logs at https://github.com/no-way-labs/cauldron/actions
 - Common issues:
   - Build failures: Check Zig version compatibility
   - Permission errors: Verify `GITHUB_TOKEN` has write permissions
@@ -115,7 +115,7 @@ If the GitHub Actions workflow failed to update the formula:
 
 - Formula not found:
   ```bash
-  brew untap no-way-labs/caldron
-  brew tap no-way-labs/caldron
+  brew untap no-way-labs/cauldron
+  brew tap no-way-labs/cauldron
   brew install mitt
   ```

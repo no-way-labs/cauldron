@@ -19,7 +19,7 @@ A CLI tool for ephemeral, encrypted file/data transfer. One party opens a "mitt"
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew tap no-way-labs/caldron
+brew tap no-way-labs/cauldron
 brew install mitt
 ```
 
@@ -424,4 +424,4 @@ If you discover a security vulnerability, please report it to the project mainta
 
 ## License
 
-See the main Caldron project license.
+See the main Cauldron project license.

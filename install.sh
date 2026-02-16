@@ -14,9 +14,9 @@ echo "Installing binaries to $INSTALL_DIR..."
 for binary in zig-out/bin/*; do
     if [ -f "$binary" ]; then
         filename=$(basename "$binary")
-        cp "$binary" "$INSTALL_DIR/caldron-$filename"
-        chmod +x "$INSTALL_DIR/caldron-$filename"
-        echo "  ✓ Installed caldron-$filename"
+        cp "$binary" "$INSTALL_DIR/cauldron-$filename"
+        chmod +x "$INSTALL_DIR/cauldron-$filename"
+        echo "  ✓ Installed cauldron-$filename"
     fi
 done
 
@@ -30,4 +30,4 @@ echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
 echo ""
 echo "Then reload your shell or run: source ~/.bashrc (or ~/.zshrc)"
 echo ""
-echo "You can now run: caldron-hello-world -- YourName"
+echo "You can now run: cauldron-hello-world -- YourName"
