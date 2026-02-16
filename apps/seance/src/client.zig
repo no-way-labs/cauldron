@@ -2,6 +2,128 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const display = @import("display.zig");
+const bot_mod = @import("bot.zig");
+
+pub const BufferedMessage = struct {
+    id: u64,
+    timestamp: u64,
+    sender: []const u8,
+    content: []const u8,
+    msg_type: []const u8,
+};
+
+pub const MessageBuffer = struct {
+    messages: std.ArrayListUnmanaged(BufferedMessage),
+    mutex: std.Thread.Mutex,
+    next_id: u64,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) MessageBuffer {
+        return .{
+            .messages = .{},
+            .mutex = .{},
+            .next_id = 1,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn append(self: *MessageBuffer, timestamp: u64, sender: []const u8, content: []const u8, msg_type: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const owned_sender = self.allocator.dupe(u8, sender) catch return;
+        const owned_content = self.allocator.dupe(u8, content) catch {
+            self.allocator.free(owned_sender);
+            return;
+        };
+        const owned_type = self.allocator.dupe(u8, msg_type) catch {
+            self.allocator.free(owned_sender);
+            self.allocator.free(owned_content);
+            return;
+        };
+
+        self.messages.append(self.allocator, .{
+            .id = self.next_id,
+            .timestamp = timestamp,
+            .sender = owned_sender,
+            .content = owned_content,
+            .msg_type = owned_type,
+        }) catch {
+            self.allocator.free(owned_sender);
+            self.allocator.free(owned_content);
+            self.allocator.free(owned_type);
+            return;
+        };
+        self.next_id += 1;
+    }
+
+    pub fn getSince(self: *MessageBuffer, since_id: u64, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var json = try std.ArrayList(u8).initCapacity(allocator, 0);
+        errdefer json.deinit(allocator);
+
+        try json.append(allocator, '[');
+        var first = true;
+        for (self.messages.items) |msg| {
+            if (msg.id <= since_id) continue;
+            if (!first) try json.append(allocator, ',');
+            first = false;
+
+            try json.appendSlice(allocator, "{\"id\":");
+            var id_buf: [20]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{msg.id}) catch continue;
+            try json.appendSlice(allocator, id_str);
+
+            try json.appendSlice(allocator, ",\"timestamp\":");
+            var ts_buf: [20]u8 = undefined;
+            const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{msg.timestamp}) catch continue;
+            try json.appendSlice(allocator, ts_str);
+
+            try json.appendSlice(allocator, ",\"sender\":\"");
+            try appendJsonEscaped(&json, allocator, msg.sender);
+            try json.appendSlice(allocator, "\",\"content\":\"");
+            try appendJsonEscaped(&json, allocator, msg.content);
+            try json.appendSlice(allocator, "\",\"type\":\"");
+            try json.appendSlice(allocator, msg.msg_type);
+            try json.appendSlice(allocator, "\"}");
+        }
+        try json.append(allocator, ']');
+
+        return json.toOwnedSlice(allocator);
+    }
+
+    pub fn deinit(self: *MessageBuffer) void {
+        for (self.messages.items) |msg| {
+            self.allocator.free(msg.sender);
+            self.allocator.free(msg.content);
+            self.allocator.free(msg.msg_type);
+        }
+        self.messages.deinit(self.allocator);
+    }
+};
+
+fn appendJsonEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, input: []const u8) !void {
+    for (input) |c| {
+        switch (c) {
+            '"' => try list.appendSlice(allocator, "\\\""),
+            '\\' => try list.appendSlice(allocator, "\\\\"),
+            '\n' => try list.appendSlice(allocator, "\\n"),
+            '\r' => try list.appendSlice(allocator, "\\r"),
+            '\t' => try list.appendSlice(allocator, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    var buf: [6]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch continue;
+                    try list.appendSlice(allocator, s);
+                } else {
+                    try list.append(allocator, c);
+                }
+            },
+        }
+    }
+}
 
 pub const ClientConfig = struct {
     nick: []const u8,
@@ -14,6 +136,10 @@ pub const Client = struct {
     key: [32]u8,
     nick: []const u8,
     running: std.atomic.Value(bool),
+    msg_buffer: ?*MessageBuffer,
+    peers: std.ArrayListUnmanaged([]const u8),
+    peers_mutex: std.Thread.Mutex,
+    stream_mutex: std.Thread.Mutex,
 
     pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16, key: [32]u8, config: ClientConfig) !Client {
         const stream = try std.net.tcpConnectToHost(allocator, host, port);
@@ -50,6 +176,10 @@ pub const Client = struct {
             .key = key,
             .nick = config.nick,
             .running = std.atomic.Value(bool).init(true),
+            .msg_buffer = null,
+            .peers = .{},
+            .peers_mutex = .{},
+            .stream_mutex = .{},
         };
     }
 
@@ -61,6 +191,74 @@ pub const Client = struct {
 
         self.sendLeave() catch {};
         self.running.store(false, .monotonic);
+    }
+
+    pub fn runBot(self: *Client, api_port: u16) !void {
+        var buffer = MessageBuffer.init(self.allocator);
+        self.msg_buffer = &buffer;
+        defer {
+            buffer.deinit();
+            self.msg_buffer = null;
+        }
+
+        const reader_thread = try std.Thread.spawn(.{}, Client.readerLoop, .{self});
+        defer reader_thread.join();
+
+        var api_server = bot_mod.ApiServer.init(self, api_port) catch |err| {
+            std.debug.print("Failed to start bot API: {}\n", .{err});
+            return err;
+        };
+        defer api_server.deinit();
+
+        const api_thread = try std.Thread.spawn(.{}, bot_mod.ApiServer.run, .{&api_server});
+        _ = api_thread;
+
+        // Block until shutdown
+        while (self.running.load(.monotonic)) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+
+        self.sendLeave() catch {};
+        api_server.stop();
+    }
+
+    pub fn sendMessage(self: *Client, text: []const u8) !void {
+        var encrypted = try crypto.encrypt(self.allocator, text, self.key);
+        defer encrypted.deinit();
+
+        const msg_frame = protocol.Frame{
+            .msg_type = .msg,
+            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .sender = self.nick,
+            .nonce = encrypted.nonce,
+            .tag = encrypted.tag,
+            .ciphertext = encrypted.ciphertext,
+        };
+
+        self.stream_mutex.lock();
+        defer self.stream_mutex.unlock();
+        try protocol.writeFrame(self.stream, msg_frame);
+
+        display.printMessage(msg_frame.timestamp, self.nick, text);
+    }
+
+    pub fn getPeers(self: *Client, allocator: std.mem.Allocator) ![]u8 {
+        self.peers_mutex.lock();
+        defer self.peers_mutex.unlock();
+
+        var json = try std.ArrayList(u8).initCapacity(allocator, 0);
+        errdefer json.deinit(allocator);
+
+        try json.append(allocator, '[');
+        for (self.peers.items, 0..) |peer, i| {
+            if (i > 0) try json.append(allocator, ',');
+            try json.append(allocator, '"');
+            try appendJsonEscaped(&json, allocator, peer);
+            try json.append(allocator, '"');
+        }
+        try json.append(allocator, ']');
+
+        return json.toOwnedSlice(allocator);
     }
 
     fn readerLoop(self: *Client) void {
@@ -76,6 +274,10 @@ pub const Client = struct {
                         self.allocator.free(plaintext);
                     }
                     display.printMessage(frame.timestamp, frame.sender, plaintext);
+
+                    if (self.msg_buffer) |buf| {
+                        buf.append(frame.timestamp, frame.sender, plaintext, "msg");
+                    }
                 },
                 .announce => {
                     const plaintext = crypto.decryptRaw(self.allocator, frame.nonce, frame.tag, frame.ciphertext, self.key) catch continue;
@@ -84,6 +286,18 @@ pub const Client = struct {
                         self.allocator.free(plaintext);
                     }
                     display.printAnnouncement(frame.timestamp, plaintext);
+
+                    if (self.msg_buffer) |buf| {
+                        const msg_type: []const u8 = if (std.mem.endsWith(u8, plaintext, " joined"))
+                            "join"
+                        else if (std.mem.endsWith(u8, plaintext, " left"))
+                            "leave"
+                        else
+                            "announce";
+                        buf.append(frame.timestamp, frame.sender, plaintext, msg_type);
+                    }
+
+                    self.updatePeersFromAnnouncement(plaintext);
                 },
                 .nick_list => {
                     const plaintext = crypto.decryptRaw(self.allocator, frame.nonce, frame.tag, frame.ciphertext, self.key) catch continue;
@@ -92,7 +306,7 @@ pub const Client = struct {
                         self.allocator.free(plaintext);
                     }
 
-                    var nicks = std.ArrayList([]const u8).initCapacity(self.allocator, 0) catch continue;
+                    var nicks = std.ArrayListUnmanaged([]const u8){};
                     defer nicks.deinit(self.allocator);
 
                     var iter = std.mem.tokenizeScalar(u8, plaintext, '\n');
@@ -101,6 +315,7 @@ pub const Client = struct {
                     }
 
                     display.printNickList(nicks.items);
+                    self.setPeers(nicks.items);
                 },
                 else => {},
             }
@@ -122,27 +337,10 @@ pub const Client = struct {
             if (line.len == 0) continue;
             if (std.mem.eql(u8, line, "/quit")) break;
 
-            var encrypted = crypto.encrypt(self.allocator, line, self.key) catch {
-                display.printStatus("Failed to encrypt message");
-                continue;
-            };
-            defer encrypted.deinit();
-
-            const msg_frame = protocol.Frame{
-                .msg_type = .msg,
-                .timestamp = @as(u64, @intCast(std.time.timestamp())),
-                .sender = self.nick,
-                .nonce = encrypted.nonce,
-                .tag = encrypted.tag,
-                .ciphertext = encrypted.ciphertext,
-            };
-
-            protocol.writeFrame(self.stream, msg_frame) catch {
+            self.sendMessage(line) catch {
                 display.printStatus("Connection lost.");
                 break;
             };
-
-            display.printMessage(msg_frame.timestamp, self.nick, line);
         }
     }
 
@@ -159,12 +357,66 @@ pub const Client = struct {
             .ciphertext = encrypted.ciphertext,
         };
 
+        self.stream_mutex.lock();
+        defer self.stream_mutex.unlock();
         try protocol.writeFrame(self.stream, leave_frame);
+    }
+
+    fn setPeers(self: *Client, nicks: []const []const u8) void {
+        self.peers_mutex.lock();
+        defer self.peers_mutex.unlock();
+
+        for (self.peers.items) |p| {
+            self.allocator.free(p);
+        }
+        self.peers.clearRetainingCapacity();
+
+        for (nicks) |nick| {
+            const owned = self.allocator.dupe(u8, nick) catch continue;
+            self.peers.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                continue;
+            };
+        }
+    }
+
+    fn updatePeersFromAnnouncement(self: *Client, text: []const u8) void {
+        if (std.mem.endsWith(u8, text, " joined")) {
+            const nick = text[0 .. text.len - " joined".len];
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            // Check for duplicate (nick_list may have already added this peer)
+            for (self.peers.items) |peer| {
+                if (std.mem.eql(u8, peer, nick)) return;
+            }
+            const owned = self.allocator.dupe(u8, nick) catch return;
+            self.peers.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+            };
+        } else if (std.mem.endsWith(u8, text, " left")) {
+            const nick = text[0 .. text.len - " left".len];
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            for (self.peers.items, 0..) |peer, i| {
+                if (std.mem.eql(u8, peer, nick)) {
+                    self.allocator.free(peer);
+                    _ = self.peers.orderedRemove(i);
+                    return;
+                }
+            }
+        }
     }
 
     pub fn disconnect(self: *Client) void {
         self.running.store(false, .monotonic);
         self.stream.close();
         std.crypto.secureZero(u8, &self.key);
+
+        self.peers_mutex.lock();
+        for (self.peers.items) |p| {
+            self.allocator.free(p);
+        }
+        self.peers.deinit(self.allocator);
+        self.peers_mutex.unlock();
     }
 };

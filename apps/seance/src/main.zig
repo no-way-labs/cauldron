@@ -52,6 +52,8 @@ fn printUsage() void {
         \\  --password <pass>    Room password (required)
         \\  --nick <name>        Your display name (default: auto-generated)
         \\  --timeout <secs>     Connection timeout (default: 30)
+        \\  --bot                Bot mode: HTTP API instead of stdin
+        \\  --api-port <port>    Bot API port (default: 9999)
         \\
     , .{});
 }
@@ -187,6 +189,8 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var password_opt: ?[]const u8 = null;
     var nick_opt: ?[]const u8 = null;
     var timeout_secs: u64 = 30;
+    var bot_mode = false;
+    var api_port: u16 = 9999;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -201,6 +205,14 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             i += 1;
             timeout_secs = std.fmt.parseInt(u64, args[i], 10) catch {
                 std.debug.print("Error: timeout must be a valid number\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--bot")) {
+            bot_mode = true;
+        } else if (std.mem.eql(u8, arg, "--api-port") and i + 1 < args.len) {
+            i += 1;
+            api_port = std.fmt.parseInt(u16, args[i], 10) catch {
+                std.debug.print("Error: api-port must be a valid number\n", .{});
                 std.process.exit(1);
             };
         }
@@ -244,8 +256,17 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
     defer client.disconnect();
 
-    std.debug.print("Connected! Type /quit to leave.\n\n", .{});
-    try client.run();
+    if (bot_mode) {
+        std.debug.print("Bot mode: HTTP API on http://127.0.0.1:{d}\n", .{api_port});
+        std.debug.print("  POST /send       - send a message\n", .{});
+        std.debug.print("  GET  /messages   - get new messages\n", .{});
+        std.debug.print("  GET  /peers      - list participants\n", .{});
+        std.debug.print("  POST /quit       - disconnect\n\n", .{});
+        try client.runBot(api_port);
+    } else {
+        std.debug.print("Connected! Type /quit to leave.\n\n", .{});
+        try client.run();
+    }
 
     std.debug.print("\nDisconnected.\n", .{});
 }
