@@ -54,7 +54,42 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
-    const test_step = b.step("test", "Run all mitt tests");
+    // Build seance app
+    const seance_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/seance/src/main.zig"),
+    });
+
+    const seance_exe = b.addExecutable(.{
+        .name = "seance",
+        .root_module = seance_module,
+    });
+    b.installArtifact(seance_exe);
+
+    // Run step for seance
+    const seance_run = b.addRunArtifact(seance_exe);
+    seance_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        seance_run.addArgs(args);
+    }
+    const seance_run_step = b.step("seance", "Run the seance app");
+    seance_run_step.dependOn(&seance_run.step);
+
+    // Unit tests for seance
+    const seance_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/seance/src/main.zig"),
+    });
+
+    const seance_tests = b.addTest(.{
+        .root_module = seance_test_module,
+    });
+    const run_seance_tests = b.addRunArtifact(seance_tests);
+
+    const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mitt_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_seance_tests.step);
 }

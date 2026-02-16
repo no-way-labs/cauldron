@@ -7,14 +7,23 @@ A monorepo for various CLI applications written in Zig.
 ```
 cauldron/
 ├── apps/
-│   └── mitt/            # Encrypted file transfer CLI
-│       ├── src/
-│       │   ├── main.zig
-│       │   ├── server.zig
-│       │   ├── client.zig
-│       │   ├── crypto.zig
-│       │   └── ...
-│       └── README.md
+│   ├── mitt/            # Encrypted file transfer CLI
+│   │   ├── src/
+│   │   │   ├── main.zig
+│   │   │   ├── server.zig
+│   │   │   ├── client.zig
+│   │   │   ├── crypto.zig
+│   │   │   └── ...
+│   │   └── README.md
+│   └── seance/          # Ephemeral encrypted P2P chat
+│       └── src/
+│           ├── main.zig
+│           ├── server.zig
+│           ├── client.zig
+│           ├── crypto.zig
+│           ├── protocol.zig
+│           ├── display.zig
+│           └── ...
 └── build.zig            # Root build file (builds all apps)
 ```
 
@@ -22,11 +31,10 @@ cauldron/
 
 ### Homebrew (macOS/Linux)
 
-Install mitt via Homebrew:
-
 ```bash
 brew tap no-way-labs/cauldron
 brew install mitt
+brew install seance
 ```
 
 ### From Source
@@ -50,6 +58,7 @@ export PATH="$HOME/.local/bin:$PATH"
 After installation, you can run apps from anywhere:
 ```bash
 mitt open
+seance host
 ```
 
 ## Building
@@ -74,6 +83,7 @@ zig build run -- open
 
 # Run specific app
 zig build mitt -- open
+zig build seance -- host --local
 ```
 
 Run from app directory:
@@ -113,6 +123,35 @@ mitt send bore.pub:54321 file.txt --password fuzzy-planet-cat
 See [apps/mitt/README.md](apps/mitt/README.md) for full documentation.
 
 **Note**: mitt is designed for trusted peer-to-peer transfers. Use over VPNs or trusted networks for sensitive data.
+
+### seance
+Ephemeral encrypted group chat. No accounts, no history, no cloud. One person hosts a room, others join with a shared password. Everything is end-to-end encrypted and vanishes when the room closes. Messages never touch disk.
+
+**Features:**
+- End-to-end encryption using XChaCha20-Poly1305
+- Argon2id key derivation with domain-separated salt
+- Auto-generated passwords (word-word-number format)
+- NAT traversal via bore tunneling (enabled by default)
+- Colored nicknames with deterministic hashing
+- Participant list on join
+- Rate limiting (10 msg/sec per peer)
+- Nick collision resolution
+- Memory security (plaintext zeroed after use)
+
+```bash
+# Host a room (auto-generates password, tunnels via bore)
+seance host
+
+# Host a local-only room (no tunnel)
+seance host --local
+
+# Join a room
+seance join bore.pub:54321 --password fuzzy-planet-42
+
+# Custom options
+seance host --port 9000 --nick alice --max-peers 4
+seance join 192.168.1.5:9000 --password mypass --nick bob
+```
 
 ## Adding New Apps
 

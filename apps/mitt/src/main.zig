@@ -161,6 +161,7 @@ fn handleOpen(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (!local_only) {
         if (tunnel.Tunnel.establish(allocator, port, bore_port)) |tun| {
             tun_opt = tun;
+            tun_opt.?.startMonitor();
             std.debug.print("Public: {s}:{d}", .{ tun.public_host, tun.public_port });
 
             // Check if we got a different port than requested
@@ -179,6 +180,7 @@ fn handleOpen(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 std.debug.print("Bore port {d} is already in use, trying random port...\n", .{bore_port});
                 if (tunnel.Tunnel.establish(allocator, port, 0)) |tun| {
                     tun_opt = tun;
+                    tun_opt.?.startMonitor();
                     std.debug.print("Public: {s}:{d}\n", .{ tun.public_host, tun.public_port });
 
                     if (!quiet) {
