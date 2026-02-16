@@ -6,6 +6,8 @@ const crypto = @import("crypto.zig");
 const display = @import("display.zig");
 const id = @import("id.zig");
 
+pub const version = "0.2.1";
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -21,7 +23,10 @@ pub fn main() !void {
 
     const command = args[1];
 
-    if (std.mem.eql(u8, command, "host")) {
+    if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
+        std.debug.print("seance {s}\n", .{version});
+        return;
+    } else if (std.mem.eql(u8, command, "host")) {
         try handleHost(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "join")) {
         try handleJoin(allocator, args[2..]);
@@ -125,7 +130,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const actual_port = srv.listener.listen_address.getPort();
 
     // Print room info
-    std.debug.print("\n\x1b[35mseance\x1b[0m - ephemeral encrypted chat\n\n", .{});
+    std.debug.print("\n\x1b[35mseance\x1b[0m v{s} - ephemeral encrypted chat\n\n", .{version});
     std.debug.print("Password: {s}\n", .{password});
     std.debug.print("Nick: {s}\n", .{nick});
     std.debug.print("Local: localhost:{d}\n", .{actual_port});
@@ -244,7 +249,7 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         try id.generate(allocator);
     defer allocator.free(nick);
 
-    std.debug.print("\n\x1b[35mseance\x1b[0m - joining room...\n", .{});
+    std.debug.print("\n\x1b[35mseance\x1b[0m v{s} - joining room...\n", .{version});
     std.debug.print("Nick: {s}\n\n", .{nick});
 
     var client = client_mod.Client.connect(allocator, host, port, key, .{

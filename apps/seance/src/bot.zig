@@ -95,11 +95,17 @@ pub const ApiServer = struct {
 
     fn handleMessages(self: *ApiServer, stream: std.net.Stream, query: []const u8) void {
         var since_id: u64 = 0;
+        var wait_secs: u64 = 0;
         if (query.len > 0) {
             if (std.mem.indexOf(u8, query, "since=")) |pos| {
                 const val_start = pos + "since=".len;
                 const val_end = std.mem.indexOfScalarPos(u8, query, val_start, '&') orelse query.len;
                 since_id = std.fmt.parseInt(u64, query[val_start..val_end], 10) catch 0;
+            }
+            if (std.mem.indexOf(u8, query, "wait=")) |pos| {
+                const val_start = pos + "wait=".len;
+                const val_end = std.mem.indexOfScalarPos(u8, query, val_start, '&') orelse query.len;
+                wait_secs = @min(std.fmt.parseInt(u64, query[val_start..val_end], 10) catch 0, 120);
             }
         }
 
@@ -107,6 +113,15 @@ pub const ApiServer = struct {
             writeResponse(stream, 500, "Internal Server Error", "text/plain", "No message buffer");
             return;
         };
+
+        // Long poll: wait up to wait_secs for new messages
+        if (wait_secs > 0) {
+            const deadline = @as(u64, @intCast(std.time.timestamp())) + wait_secs;
+            while (@as(u64, @intCast(std.time.timestamp())) < deadline and self.running.load(.monotonic)) {
+                if (buf.hasMessagesSince(since_id)) break;
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+            }
+        }
 
         const json = buf.getSince(since_id, self.client.allocator) catch {
             writeResponse(stream, 500, "Internal Server Error", "text/plain", "Failed to get messages");

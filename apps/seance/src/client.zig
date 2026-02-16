@@ -57,6 +57,12 @@ pub const MessageBuffer = struct {
         self.next_id += 1;
     }
 
+    pub fn hasMessagesSince(self: *MessageBuffer, since_id: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.next_id > since_id + 1;
+    }
+
     pub fn getSince(self: *MessageBuffer, since_id: u64, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
