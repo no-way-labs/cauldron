@@ -37,41 +37,27 @@ brew install mitt
 brew install seance
 ```
 
+### Prebuilt Binaries
+
+Download from [GitHub Releases](https://github.com/no-way-labs/cauldron/releases):
+
+```bash
+# Example: seance on Linux x86_64
+curl -L https://github.com/no-way-labs/cauldron/releases/latest/download/seance-linux-x86_64.tar.gz | tar xz
+./seance host
+```
+
 ### From Source
 
-Install all CLI apps to `~/.local/bin`:
+Requires **Zig 0.15.x** (0.15.2 recommended). Will not compile with Zig 0.16+.
 
-```bash
-./install.sh
-```
-
-To install to a custom location:
-```bash
-INSTALL_DIR=/usr/local/bin ./install.sh
-```
-
-Make sure `~/.local/bin` is in your PATH:
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-After installation, you can run apps from anywhere:
-```bash
-mitt open
-seance host
-```
-
-## Building
-
-Build all apps from the root:
 ```bash
 zig build
 ```
 
-Build a specific app:
+Install all apps to `~/.local/bin`:
 ```bash
-cd apps/mitt
-zig build
+INSTALL_DIR=~/.local/bin ./install.sh
 ```
 
 ## Running (without installing)
@@ -147,6 +133,11 @@ seance host --local
 
 # Join a room
 seance join bore.pub:54321 --password fuzzy-planet-42
+
+# Bot mode - HTTP API instead of stdin/stdout
+seance join bore.pub:54321 --password fuzzy-planet-42 --bot --api-port 9999
+curl -X POST localhost:9999/send -d "hello from a script"
+curl localhost:9999/messages?since=0&wait=30
 
 # Custom options
 seance host --port 9000 --nick alice --max-peers 4
