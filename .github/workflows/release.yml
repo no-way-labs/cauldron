@@ -109,9 +109,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -187,6 +184,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Checkout homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: no-way-labs/homebrew-cauldron
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
       - name: Update Homebrew formula
         run: |
           APP="${{ steps.app.outputs.name }}"
@@ -199,30 +203,31 @@ jobs:
             LINUX_ARM64_SHA=$(cat artifacts/seance-linux-aarch64/*.sha256 | awk '{print $1}')
             LINUX_X86_64_SHA=$(cat artifacts/seance-linux-x86_64/*.sha256 | awk '{print $1}')
 
-            sed -i "s/version \".*\"/version \"${VERSION#v}\"/" Formula/seance.rb
-            sed -i "s|download/seance-v[0-9.]*\/|download/$TAG/|g" Formula/seance.rb
-            sed -i "/seance-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/seance.rb
-            sed -i "/seance-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" Formula/seance.rb
-            sed -i "/seance-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" Formula/seance.rb
-            sed -i "/seance-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" Formula/seance.rb
+            sed -i "s/version \".*\"/version \"${VERSION#v}\"/" homebrew-tap/Formula/seance.rb
+            sed -i "s|download/seance-v[0-9.]*\/|download/$TAG/|g" homebrew-tap/Formula/seance.rb
+            sed -i "/seance-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" homebrew-tap/Formula/seance.rb
+            sed -i "/seance-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" homebrew-tap/Formula/seance.rb
+            sed -i "/seance-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" homebrew-tap/Formula/seance.rb
+            sed -i "/seance-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" homebrew-tap/Formula/seance.rb
           else
             ARM64_SHA=$(cat artifacts/mitt-macos-aarch64/*.sha256 | awk '{print $1}')
             X86_64_SHA=$(cat artifacts/mitt-macos-x86_64/*.sha256 | awk '{print $1}')
             LINUX_ARM64_SHA=$(cat artifacts/mitt-linux-aarch64/*.sha256 | awk '{print $1}')
             LINUX_X86_64_SHA=$(cat artifacts/mitt-linux-x86_64/*.sha256 | awk '{print $1}')
 
-            sed -i "s/version \".*\"/version \"${VERSION#v}\"/" Formula/mitt.rb
-            sed -i "s|download/v[0-9.]*\/|download/$VERSION/|g" Formula/mitt.rb
-            sed -i "/mitt-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" Formula/mitt.rb
-            sed -i "/mitt-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" Formula/mitt.rb
-            sed -i "/mitt-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" Formula/mitt.rb
-            sed -i "/mitt-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" Formula/mitt.rb
+            sed -i "s/version \".*\"/version \"${VERSION#v}\"/" homebrew-tap/Formula/mitt.rb
+            sed -i "s|download/v[0-9.]*\/|download/$VERSION/|g" homebrew-tap/Formula/mitt.rb
+            sed -i "/mitt-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" homebrew-tap/Formula/mitt.rb
+            sed -i "/mitt-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" homebrew-tap/Formula/mitt.rb
+            sed -i "/mitt-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" homebrew-tap/Formula/mitt.rb
+            sed -i "/mitt-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" homebrew-tap/Formula/mitt.rb
           fi
 
-      - name: Commit updated formula
+      - name: Push updated formula
         run: |
+          cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/
-          git commit -m "Update Homebrew formula for ${{ github.ref_name }}"
-          git push origin HEAD:main
+          git commit -m "Update ${{ steps.app.outputs.name }} formula for ${{ github.ref_name }}"
+          git push
