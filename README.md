@@ -39,7 +39,7 @@ brew install seance
 
 ### From Source
 
-Install all CLI apps to `~/.local/bin` with the `cauldron-` prefix:
+Install all CLI apps to `~/.local/bin`:
 
 ```bash
 ./install.sh
