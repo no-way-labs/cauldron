@@ -6,7 +6,7 @@ const crypto = @import("crypto.zig");
 const display = @import("display.zig");
 const id = @import("id.zig");
 
-pub const version = "0.2.7";
+pub const version = "0.2.8";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -35,6 +35,16 @@ pub fn main() !void {
         printUsage();
         std.process.exit(1);
     }
+}
+
+fn printBanner() void {
+    std.debug.print("\n\x1b[38;5;54m                \xc2\xb7  \x1b[38;5;183m\xe2\x9c\xa6\x1b[38;5;54m  \xc2\xb7\x1b[0m\n\n", .{});
+    std.debug.print("\x1b[38;5;91m        \xe2\x95\x94\xe2\x95\x90\xe2\x95\x97 \xe2\x95\x94\xe2\x95\x90\xe2\x95\x97 \xe2\x95\x94\xe2\x95\x90\xe2\x95\x97 \xe2\x95\x94\xe2\x95\x97\xe2\x95\x94 \xe2\x95\x94\xe2\x95\x90\xe2\x95\x97 \xe2\x95\x94\xe2\x95\x90\xe2\x95\x97\x1b[0m\n", .{});
+    std.debug.print("\x1b[38;5;128m        \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x97 \xe2\x95\x91\xe2\x95\xa3  \xe2\x95\xa0\xe2\x95\x90\xe2\x95\xa3 \xe2\x95\x91\xe2\x95\x91\xe2\x95\x91 \xe2\x95\x91   \xe2\x95\x91\xe2\x95\xa3\x1b[0m\n", .{});
+    std.debug.print("\x1b[38;5;177m        \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x9d \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x9d \xe2\x95\xa9 \xe2\x95\xa9 \xe2\x95\x9d\xe2\x95\x9a\xe2\x95\x9d \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x9d \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x9d\x1b[0m\n", .{});
+    std.debug.print("\x1b[38;5;245m\n       ephemeral encrypted chat\x1b[0m\n", .{});
+    std.debug.print("\x1b[38;5;240m                v{s}\x1b[0m\n\n", .{version});
+    std.debug.print("\x1b[38;5;54m                \xc2\xb7  \x1b[38;5;183m\xe2\x9c\xa7\x1b[38;5;54m  \xc2\xb7\x1b[0m\n\n", .{});
 }
 
 fn printUsage() void {
@@ -131,10 +141,10 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const actual_port = srv.listener.listen_address.getPort();
 
     // Print room info
-    std.debug.print("\n\x1b[35mseance\x1b[0m v{s} - ephemeral encrypted chat\n\n", .{version});
-    std.debug.print("Password: {s}\n", .{password});
-    std.debug.print("Nick: {s}\n", .{nick});
-    std.debug.print("Local: localhost:{d}\n", .{actual_port});
+    printBanner();
+    std.debug.print("\x1b[38;5;245mPassword:\x1b[0m {s}\n", .{password});
+    std.debug.print("\x1b[38;5;245mNick:\x1b[0m {s}\n", .{nick});
+    std.debug.print("\x1b[38;5;245mLocal:\x1b[0m localhost:{d}\n", .{actual_port});
 
     // Establish tunnel
     var tun_opt: ?tunnel.Tunnel = null;
@@ -144,17 +154,17 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (tunnel.Tunnel.establish(allocator, actual_port, bore_port)) |tun| {
             tun_opt = tun;
             tun_opt.?.startMonitor();
-            std.debug.print("Public: {s}:{d}", .{ tun.public_host, tun.public_port });
+            std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}", .{ tun.public_host, tun.public_port });
             if (tun.requested_port > 0 and tun.requested_port != tun.public_port) {
                 std.debug.print(" (requested {d} but unavailable)", .{tun.requested_port});
             }
             std.debug.print("\n", .{});
 
-            std.debug.print("\nTo join:\n", .{});
-            std.debug.print("  seance join {s}:{d} --password {s}\n", .{
+            std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
+            std.debug.print("  \x1b[38;5;240mseance join {s}:{d} --password {s}\x1b[0m\n", .{
                 tun.public_host, tun.public_port, password,
             });
-            std.debug.print("  seance join {s}:{d} --password {s} --familiar\n\n", .{
+            std.debug.print("  \x1b[38;5;240mseance join {s}:{d} --password {s} --familiar\x1b[0m\n\n", .{
                 tun.public_host, tun.public_port, password,
             });
         } else |err| {
@@ -163,34 +173,34 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 if (tunnel.Tunnel.establish(allocator, actual_port, 0)) |tun| {
                     tun_opt = tun;
                     tun_opt.?.startMonitor();
-                    std.debug.print("Public: {s}:{d}\n", .{ tun.public_host, tun.public_port });
-                    std.debug.print("\nTo join:\n", .{});
-                    std.debug.print("  seance join {s}:{d} --password {s}\n", .{
+                    std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}\n", .{ tun.public_host, tun.public_port });
+                    std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
+                    std.debug.print("  \x1b[38;5;240mseance join {s}:{d} --password {s}\x1b[0m\n", .{
                         tun.public_host, tun.public_port, password,
                     });
-                    std.debug.print("  seance join {s}:{d} --password {s} --familiar\n\n", .{
+                    std.debug.print("  \x1b[38;5;240mseance join {s}:{d} --password {s} --familiar\x1b[0m\n\n", .{
                         tun.public_host, tun.public_port, password,
                     });
                 } else |retry_err| {
-                    std.debug.print("Warning: tunnel failed ({any}), local only.\n", .{retry_err});
-                    std.debug.print("\nTo join:\n", .{});
-                    std.debug.print("  seance join localhost:{d} --password {s}\n", .{ actual_port, password });
-                    std.debug.print("  seance join localhost:{d} --password {s} --familiar\n\n", .{ actual_port, password });
+                    std.debug.print("\x1b[38;5;240mWarning: tunnel failed ({any}), local only.\x1b[0m\n", .{retry_err});
+                    std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
+                    std.debug.print("  \x1b[38;5;240mseance join localhost:{d} --password {s}\x1b[0m\n", .{ actual_port, password });
+                    std.debug.print("  \x1b[38;5;240mseance join localhost:{d} --password {s} --familiar\x1b[0m\n\n", .{ actual_port, password });
                 }
             } else {
-                std.debug.print("Warning: tunnel failed ({any}), local only.\n", .{err});
-                std.debug.print("\nTo join:\n", .{});
-                std.debug.print("  seance join localhost:{d} --password {s}\n", .{ actual_port, password });
-                std.debug.print("  seance join localhost:{d} --password {s} --familiar\n\n", .{ actual_port, password });
+                std.debug.print("\x1b[38;5;240mWarning: tunnel failed ({any}), local only.\x1b[0m\n", .{err});
+                std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
+                std.debug.print("  \x1b[38;5;240mseance join localhost:{d} --password {s}\x1b[0m\n", .{ actual_port, password });
+                std.debug.print("  \x1b[38;5;240mseance join localhost:{d} --password {s} --familiar\x1b[0m\n\n", .{ actual_port, password });
             }
         }
     } else {
-        std.debug.print("\nTo join:\n", .{});
-        std.debug.print("  seance join localhost:{d} --password {s}\n", .{ actual_port, password });
-        std.debug.print("  seance join localhost:{d} --password {s} --familiar\n\n", .{ actual_port, password });
+        std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
+        std.debug.print("  \x1b[38;5;240mseance join localhost:{d} --password {s}\x1b[0m\n", .{ actual_port, password });
+        std.debug.print("  \x1b[38;5;240mseance join localhost:{d} --password {s} --familiar\x1b[0m\n\n", .{ actual_port, password });
     }
 
-    std.debug.print("Waiting for participants... (type /quit to exit)\n\n", .{});
+    std.debug.print("\x1b[38;5;245mWaiting for participants...\x1b[38;5;240m (type /quit to exit)\x1b[0m\n\n", .{});
     try srv.run();
 }
 
@@ -263,8 +273,8 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         try id.generate(allocator);
     defer allocator.free(nick);
 
-    std.debug.print("\n\x1b[35mseance\x1b[0m v{s} - joining room...\n", .{version});
-    std.debug.print("Nick: {s}\n\n", .{nick});
+    printBanner();
+    std.debug.print("\x1b[38;5;245mNick:\x1b[0m {s}\n\n", .{nick});
 
     var client = client_mod.Client.connect(allocator, host, port, key, .{
         .nick = nick,
@@ -284,7 +294,7 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         std.debug.print("  POST /quit       - disconnect\n\n", .{});
         try client.runBot(api_port, run_familiar);
     } else {
-        std.debug.print("Connected! Type /quit to leave.\n\n", .{});
+        std.debug.print("\x1b[38;5;141mConnected!\x1b[38;5;240m Type /quit to leave.\x1b[0m\n\n", .{});
         try client.run();
     }
 

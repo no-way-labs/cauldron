@@ -34,6 +34,9 @@ const all_colors = [_]Color{
     .bright_cyan,
 };
 
+// Input prompt: purple "› "
+const prompt_str = "\x1b[38;5;141m\xe2\x80\xba \x1b[0m";
+
 pub fn colorForNick(nick: []const u8) Color {
     var hash: u32 = 0;
     for (nick) |c| {
@@ -164,11 +167,9 @@ pub fn inputEnd() void {
 pub fn inputClear() void {
     input_mutex.lock();
     defer input_mutex.unlock();
-    if (input_len > 0) {
-        std.debug.print("\r\x1b[2K", .{});
-        input_len = 0;
-        input_cursor = 0;
-    }
+    std.debug.print("\r\x1b[2K" ++ prompt_str, .{});
+    input_len = 0;
+    input_cursor = 0;
 }
 
 /// Take the current input, clear the buffer, return the text.
@@ -208,11 +209,19 @@ pub fn handleEscapeSeq(stdin: std.fs.File) void {
 
 // Restore partial input after printing (must hold input_mutex).
 fn restoreInput() void {
+    std.debug.print(prompt_str, .{});
     if (input_len > 0) {
         std.debug.print("{s}", .{input_buf[0..input_len]});
         const back = input_len - input_cursor;
         if (back > 0) std.debug.print("\x1b[{d}D", .{back});
     }
+}
+
+/// Show the input prompt (call once when entering interactive mode).
+pub fn showPrompt() void {
+    input_mutex.lock();
+    defer input_mutex.unlock();
+    std.debug.print(prompt_str, .{});
 }
 
 // --- Display functions ---

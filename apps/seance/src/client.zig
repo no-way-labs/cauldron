@@ -372,6 +372,7 @@ pub const Client = struct {
         };
 
         if (raw_mode) {
+            display.showPrompt();
             var submit_buf: [4096]u8 = undefined;
             while (self.running.load(.monotonic)) {
                 var byte_buf: [1]u8 = undefined;
@@ -385,6 +386,7 @@ pub const Client = struct {
                         const line = display.inputSubmit(&submit_buf);
                         if (line.len == 0) continue;
                         if (std.mem.eql(u8, line, "/quit")) break;
+                        display.printMessage(@as(u64, @intCast(std.time.timestamp())), self.nick, line);
                         self.sendMessage(line) catch {
                             display.printStatus("Connection lost.");
                             break;
