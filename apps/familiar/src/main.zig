@@ -1,7 +1,7 @@
 const std = @import("std");
 const claude = @import("claude.zig");
 
-pub const version = "0.1.1";
+pub const version = "0.1.2";
 
 const Config = struct {
     api_host: []const u8,
@@ -84,7 +84,7 @@ pub fn main() !void {
     std.debug.print("Connecting to seance bot at {s}:{d}\n", .{ config.api_host, config.api_port });
 
     // Get OAuth token
-    const token = claude.getToken(allocator) catch |err| {
+    var token = claude.getToken(allocator) catch |err| {
         std.debug.print("Failed to get token: {}\n", .{err});
         std.debug.print("Set CLAUDE_CODE_OAUTH_TOKEN or run 'claude setup-token'\n", .{});
         std.process.exit(1);
@@ -187,8 +187,22 @@ pub fn main() !void {
                 config.system_prompt,
                 history.items,
             ) catch |err| {
-                logTs();
-                std.debug.print("Claude API error: {}\n", .{err});
+                if (err == error.TokenExpired) {
+                    logTs();
+                    std.debug.print("Token expired, refreshing...\n", .{});
+                    const new_token = claude.getToken(allocator) catch |te| {
+                        logTs();
+                        std.debug.print("Token refresh failed: {}\n", .{te});
+                        continue;
+                    };
+                    allocator.free(token);
+                    token = new_token;
+                    logTs();
+                    std.debug.print("Token refreshed.\n", .{});
+                } else {
+                    logTs();
+                    std.debug.print("Claude API error: {}\n", .{err});
+                }
                 continue;
             };
             defer allocator.free(response);

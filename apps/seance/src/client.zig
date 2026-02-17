@@ -378,6 +378,7 @@ pub const Client = struct {
 
     fn stdinLoop(self: *Client) void {
         const stdin = std.fs.File.stdin();
+        const is_tty = std.posix.isatty(stdin.handle);
         var buffer: [4096]u8 = undefined;
 
         while (self.running.load(.monotonic)) {
@@ -388,6 +389,11 @@ pub const Client = struct {
 
             if (line.len == 0) continue;
             if (std.mem.eql(u8, line, "/quit")) break;
+
+            // Erase the terminal-echoed input line
+            if (is_tty) {
+                std.debug.print("\x1b[A\x1b[2K\r", .{});
+            }
 
             self.sendMessage(line) catch {
                 display.printStatus("Connection lost.");

@@ -350,8 +350,9 @@ pub const Server = struct {
     }
 
     fn readHostStdin(self: *Server) void {
-        var buffer: [4096]u8 = undefined;
         const stdin = std.fs.File.stdin();
+        const is_tty = std.posix.isatty(stdin.handle);
+        var buffer: [4096]u8 = undefined;
 
         while (self.running.load(.monotonic)) {
             const bytes_read = stdin.read(&buffer) catch break;
@@ -364,6 +365,11 @@ pub const Server = struct {
             if (std.mem.eql(u8, trimmed, "/quit")) {
                 self.running.store(false, .monotonic);
                 break;
+            }
+
+            // Erase the terminal-echoed input line
+            if (is_tty) {
+                std.debug.print("\x1b[A\x1b[2K\r", .{});
             }
 
             var encrypted = crypto.encrypt(self.allocator, trimmed, self.key) catch continue;
