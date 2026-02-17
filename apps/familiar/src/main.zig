@@ -1,7 +1,7 @@
 const std = @import("std");
 const claude = @import("claude.zig");
 
-pub const version = "0.1.0";
+pub const version = "0.1.1";
 
 const Config = struct {
     api_host: []const u8,
