@@ -400,6 +400,9 @@ pub const Server = struct {
                 },
                 127, 8 => display.inputBackspace(),
                 21 => display.inputClear(), // Ctrl+U
+                1 => display.inputHome(), // Ctrl+A
+                5 => display.inputEnd(), // Ctrl+E
+                27 => display.handleEscapeSeq(stdin), // ESC
                 else => {
                     if (byte >= 32) display.inputChar(byte);
                 },
