@@ -45,24 +45,37 @@ pub const ApiServer = struct {
     fn handleConnection(self: *ApiServer, stream: std.net.Stream) void {
         defer stream.close();
 
-        std.debug.print("[bot-api] connection accepted\n", .{});
-
         var buffer: [8192]u8 = undefined;
-        const bytes_read = stream.read(&buffer) catch return;
-        if (bytes_read == 0) return;
+        var total: usize = 0;
 
-        std.debug.print("[bot-api] read {d} bytes\n", .{bytes_read});
+        // Read until we have the full request (headers + body)
+        while (total < buffer.len) {
+            const bytes_read = stream.read(buffer[total..]) catch return;
+            if (bytes_read == 0) break;
+            total += bytes_read;
 
-        const request = parseRequest(buffer[0..bytes_read]) orelse {
+            // Check if we have headers yet
+            if (std.mem.indexOf(u8, buffer[0..total], "\r\n\r\n")) |headers_end| {
+                // Parse Content-Length to know how much body to expect
+                var content_length: usize = 0;
+                if (std.mem.indexOf(u8, buffer[0..headers_end], "Content-Length: ")) |cl_pos| {
+                    const cl_start = cl_pos + "Content-Length: ".len;
+                    const cl_end = std.mem.indexOfScalarPos(u8, buffer[0..headers_end], cl_start, '\r') orelse headers_end;
+                    content_length = std.fmt.parseInt(usize, buffer[cl_start..cl_end], 10) catch 0;
+                }
+                const body_start = headers_end + 4;
+                if (total >= body_start + content_length) break;
+            }
+        }
+
+        if (total == 0) return;
+
+        const request = parseRequest(buffer[0..total]) orelse {
             writeResponse(stream, 400, "Bad Request", "text/plain", "Invalid HTTP request");
             return;
         };
 
-        std.debug.print("[bot-api] {s} {s}\n", .{if (request.method == .GET) "GET" else "POST", request.path});
-
         self.routeRequest(stream, request);
-
-        std.debug.print("[bot-api] response sent\n", .{});
     }
 
     fn routeRequest(self: *ApiServer, stream: std.net.Stream, request: HttpRequest) void {

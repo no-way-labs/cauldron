@@ -292,29 +292,37 @@ fn rawHttpPost(allocator: std.mem.Allocator, host: []const u8, port: u16, path: 
 
     try std.posix.connect(stream, &addr.any, addr.getOsSockLen());
 
-    // Send POST request
+    // Send POST request with body in a single write where possible
     var req_buf: [1024]u8 = undefined;
-    const req = std.fmt.bufPrint(&req_buf, "POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ path, host, port, body.len }) catch return error.RequestTooLong;
+    const header = std.fmt.bufPrint(&req_buf, "POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ path, host, port, body.len }) catch return error.RequestTooLong;
+
+    // Combine header and body into one send to avoid TCP framing issues
+    const combined = try allocator.alloc(u8, header.len + body.len);
+    defer allocator.free(combined);
+    @memcpy(combined[0..header.len], header);
+    @memcpy(combined[header.len..], body);
 
     var sent: usize = 0;
-    while (sent < req.len) {
-        const n = std.posix.send(stream, req[sent..], 0) catch return error.SendFailed;
+    while (sent < combined.len) {
+        const n = std.posix.send(stream, combined[sent..], 0) catch return error.SendFailed;
         sent += n;
     }
 
-    // Send body
-    sent = 0;
-    while (sent < body.len) {
-        const n = std.posix.send(stream, body[sent..], 0) catch return error.SendFailed;
-        sent += n;
+    // Read response and check status
+    const resp = try readHttpResponse(allocator, stream);
+    defer allocator.free(resp.body);
+    if (resp.status != 200) {
+        std.debug.print("POST {s} returned {d}: {s}\n", .{ path, resp.status, resp.body });
+        return error.SendFailed;
     }
-
-    // Read and discard response
-    const resp = try readHttpBody(allocator, stream);
-    allocator.free(resp);
 }
 
-fn readHttpBody(allocator: std.mem.Allocator, stream: std.posix.socket_t) ![]u8 {
+const HttpResponse = struct {
+    status: u16,
+    body: []u8,
+};
+
+fn readHttpResponse(allocator: std.mem.Allocator, stream: std.posix.socket_t) !HttpResponse {
     var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(allocator);
 
@@ -330,6 +338,15 @@ fn readHttpBody(allocator: std.mem.Allocator, stream: std.posix.socket_t) ![]u8 
     const data = buf.items;
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return error.NoBody;
     const body_start = header_end + 4;
+
+    // Parse status code from first line (e.g. "HTTP/1.1 200 OK\r\n")
+    var status: u16 = 0;
+    if (std.mem.indexOf(u8, data[0..header_end], " ")) |sp| {
+        const after_sp = sp + 1;
+        const status_end = std.mem.indexOfScalarPos(u8, data[0..header_end], after_sp, ' ') orelse
+            std.mem.indexOfScalarPos(u8, data[0..header_end], after_sp, '\r') orelse header_end;
+        status = std.fmt.parseInt(u16, data[after_sp..status_end], 10) catch 0;
+    }
 
     // Parse Content-Length from headers
     const headers = data[0..header_end];
@@ -347,7 +364,15 @@ fn readHttpBody(allocator: std.mem.Allocator, stream: std.posix.socket_t) ![]u8 
         try buf.appendSlice(allocator, tmp[0..n]);
     }
 
-    return try allocator.dupe(u8, buf.items[body_start..]);
+    return .{
+        .status = status,
+        .body = try allocator.dupe(u8, buf.items[body_start..]),
+    };
+}
+
+fn readHttpBody(allocator: std.mem.Allocator, stream: std.posix.socket_t) ![]u8 {
+    const resp = try readHttpResponse(allocator, stream);
+    return resp.body;
 }
 
 // --- Utilities ---

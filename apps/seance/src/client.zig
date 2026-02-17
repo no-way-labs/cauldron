@@ -199,7 +199,7 @@ pub const Client = struct {
         self.running.store(false, .monotonic);
     }
 
-    pub fn runBot(self: *Client, api_port: u16) !void {
+    pub fn runBot(self: *Client, api_port: u16, run_familiar: bool) !void {
         var buffer = MessageBuffer.init(self.allocator);
         self.msg_buffer = &buffer;
         defer {
@@ -218,6 +218,52 @@ pub const Client = struct {
 
         const api_thread = try std.Thread.spawn(.{}, bot_mod.ApiServer.run, .{&api_server});
         _ = api_thread;
+
+        // Spawn familiar process if requested
+        var familiar_proc: ?std.process.Child = null;
+        if (run_familiar) {
+            // Find familiar binary next to our own executable
+            var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const familiar_path = blk: {
+                const exe_path = std.fs.selfExePath(&exe_buf) catch break :blk null;
+                // Replace trailing "seance" with "familiar"
+                if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |sep| {
+                    const dir = exe_path[0 .. sep + 1];
+                    const familiar_name = "familiar";
+                    if (dir.len + familiar_name.len <= exe_buf.len) {
+                        @memcpy(exe_buf[dir.len .. dir.len + familiar_name.len], familiar_name);
+                        break :blk exe_buf[0 .. dir.len + familiar_name.len];
+                    }
+                }
+                break :blk null;
+            };
+
+            var port_buf: [8]u8 = undefined;
+            const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{api_port}) catch unreachable;
+            const argv_path: []const u8 = familiar_path orelse "familiar";
+            var proc = std.process.Child.init(
+                &.{ argv_path, "--api-port", port_str },
+                self.allocator,
+            );
+            proc.stdout_behavior = .Inherit;
+            proc.stderr_behavior = .Inherit;
+            if (proc.spawn()) {
+                familiar_proc = proc;
+            } else |err| {
+                std.debug.print("Failed to start familiar: {}\n", .{err});
+                if (familiar_path) |p| {
+                    std.debug.print("Tried: {s}\n", .{p});
+                } else {
+                    std.debug.print("Make sure 'familiar' is in your PATH\n", .{});
+                }
+            }
+        }
+        defer {
+            if (familiar_proc) |*proc| {
+                std.posix.kill(proc.id, std.posix.SIG.TERM) catch {};
+                _ = proc.wait() catch {};
+            }
+        }
 
         // Block until shutdown
         while (self.running.load(.monotonic)) {
