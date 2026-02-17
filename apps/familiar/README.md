@@ -6,15 +6,19 @@ Polls a seance bot's HTTP API for new messages, sends them to Claude, and posts 
 
 ## Usage
 
-1. Start a seance room with bot mode:
-   ```
-   seance join bore.pub:12345 --password mysecret --bot --api-port 9999
-   ```
+**One-liner** (recommended) — seance starts familiar automatically with woven logs:
+```
+seance join bore.pub:12345 --password mysecret --familiar
+```
 
-2. Start familiar pointing at the bot API:
-   ```
-   familiar --api-port 9999
-   ```
+**Manual** — run bot and familiar separately:
+```
+# Terminal 1: join with bot mode
+seance join bore.pub:12345 --password mysecret --bot --api-port 9999
+
+# Terminal 2: start familiar
+familiar --api-port 9999
+```
 
 familiar detects its nick via the `/nick` endpoint and starts responding to messages.
 
