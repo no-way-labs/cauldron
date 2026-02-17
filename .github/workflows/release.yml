@@ -5,6 +5,7 @@ on:
     tags:
       - 'v*'
       - 'seance-v*'
+      - 'familiar-v*'
   workflow_dispatch:
     inputs:
       version:
@@ -52,6 +53,23 @@ jobs:
             os: ubuntu-latest
             zig_target: aarch64-linux
             artifact: seance-linux-aarch64
+          # familiar
+          - app: familiar
+            os: macos-latest
+            zig_target: aarch64-macos
+            artifact: familiar-macos-aarch64
+          - app: familiar
+            os: macos-latest
+            zig_target: x86_64-macos
+            artifact: familiar-macos-x86_64
+          - app: familiar
+            os: ubuntu-latest
+            zig_target: x86_64-linux
+            artifact: familiar-linux-x86_64
+          - app: familiar
+            os: ubuntu-latest
+            zig_target: aarch64-linux
+            artifact: familiar-linux-aarch64
 
     steps:
       - name: Check if this app should build
@@ -61,7 +79,9 @@ jobs:
           APP="${{ matrix.app }}"
           if [[ "$TAG" == seance-v* && "$APP" == "seance" ]]; then
             echo "should_build=true" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == v* && ! "$TAG" == seance-v* && "$APP" == "mitt" ]]; then
+          elif [[ "$TAG" == familiar-v* && "$APP" == "familiar" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == v* && ! "$TAG" == seance-v* && ! "$TAG" == familiar-v* && "$APP" == "mitt" ]]; then
             echo "should_build=true" >> $GITHUB_OUTPUT
           else
             echo "should_build=false" >> $GITHUB_OUTPUT
@@ -122,6 +142,9 @@ jobs:
           if [[ "$TAG" == seance-v* ]]; then
             echo "name=seance" >> $GITHUB_OUTPUT
             echo "version=${TAG#seance-}" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == familiar-v* ]]; then
+            echo "name=familiar" >> $GITHUB_OUTPUT
+            echo "version=${TAG#familiar-}" >> $GITHUB_OUTPUT
           else
             echo "name=mitt" >> $GITHUB_OUTPUT
             echo "version=$TAG" >> $GITHUB_OUTPUT
@@ -143,6 +166,19 @@ jobs:
           brew tap no-way-labs/cauldron
           brew install seance
           ```
+
+          ### Manual Installation
+          Download the appropriate binary for your platform below and extract it.
+
+          ## SHA256 Checksums
+          EOF
+          elif [ "$APP" = "familiar" ]; then
+            cat > release_notes.md << 'EOF'
+          # familiar ${{ github.ref_name }}
+
+          Autonomous Claude-powered chat bot for seance rooms.
+
+          ## Installation
 
           ### Manual Installation
           Download the appropriate binary for your platform below and extract it.
@@ -185,6 +221,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout homebrew tap
+        if: steps.app.outputs.name != 'familiar'
         uses: actions/checkout@v4
         with:
           repository: no-way-labs/homebrew-cauldron
@@ -192,6 +229,7 @@ jobs:
           path: homebrew-tap
 
       - name: Update Homebrew formula
+        if: steps.app.outputs.name != 'familiar'
         run: |
           APP="${{ steps.app.outputs.name }}"
           TAG="${{ github.ref_name }}"
@@ -224,6 +262,7 @@ jobs:
           fi
 
       - name: Push updated formula
+        if: steps.app.outputs.name != 'familiar'
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
