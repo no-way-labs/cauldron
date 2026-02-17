@@ -54,12 +54,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    // Shared familiar core module (used by both seance and familiar)
+    const familiar_core = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/familiar/src/core.zig"),
+    });
+
     // Build seance app
     const seance_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("apps/seance/src/main.zig"),
     });
+    seance_module.addImport("familiar_core", familiar_core);
 
     const seance_exe = b.addExecutable(.{
         .name = "seance",
@@ -82,6 +90,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("apps/seance/src/main.zig"),
     });
+    seance_test_module.addImport("familiar_core", familiar_core);
 
     const seance_tests = b.addTest(.{
         .root_module = seance_test_module,
@@ -94,6 +103,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("apps/familiar/src/main.zig"),
     });
+    familiar_module.addImport("familiar_core", familiar_core);
 
     const familiar_exe = b.addExecutable(.{
         .name = "familiar",
@@ -116,6 +126,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("apps/familiar/src/main.zig"),
     });
+    familiar_test_module.addImport("familiar_core", familiar_core);
 
     const familiar_tests = b.addTest(.{
         .root_module = familiar_test_module,

@@ -6,7 +6,7 @@ const crypto = @import("crypto.zig");
 const display = @import("display.zig");
 const id = @import("id.zig");
 
-pub const version = "0.2.6";
+pub const version = "0.2.7";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -151,7 +151,10 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             std.debug.print("\n", .{});
 
             std.debug.print("\nTo join:\n", .{});
-            std.debug.print("  seance join {s}:{d} --password {s}\n\n", .{
+            std.debug.print("  seance join {s}:{d} --password {s}\n", .{
+                tun.public_host, tun.public_port, password,
+            });
+            std.debug.print("  seance join {s}:{d} --password {s} --familiar\n\n", .{
                 tun.public_host, tun.public_port, password,
             });
         } else |err| {
@@ -162,23 +165,29 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     tun_opt.?.startMonitor();
                     std.debug.print("Public: {s}:{d}\n", .{ tun.public_host, tun.public_port });
                     std.debug.print("\nTo join:\n", .{});
-                    std.debug.print("  seance join {s}:{d} --password {s}\n\n", .{
+                    std.debug.print("  seance join {s}:{d} --password {s}\n", .{
+                        tun.public_host, tun.public_port, password,
+                    });
+                    std.debug.print("  seance join {s}:{d} --password {s} --familiar\n\n", .{
                         tun.public_host, tun.public_port, password,
                     });
                 } else |retry_err| {
                     std.debug.print("Warning: tunnel failed ({any}), local only.\n", .{retry_err});
                     std.debug.print("\nTo join:\n", .{});
-                    std.debug.print("  seance join localhost:{d} --password {s}\n\n", .{ actual_port, password });
+                    std.debug.print("  seance join localhost:{d} --password {s}\n", .{ actual_port, password });
+                    std.debug.print("  seance join localhost:{d} --password {s} --familiar\n\n", .{ actual_port, password });
                 }
             } else {
                 std.debug.print("Warning: tunnel failed ({any}), local only.\n", .{err});
                 std.debug.print("\nTo join:\n", .{});
-                std.debug.print("  seance join localhost:{d} --password {s}\n\n", .{ actual_port, password });
+                std.debug.print("  seance join localhost:{d} --password {s}\n", .{ actual_port, password });
+                std.debug.print("  seance join localhost:{d} --password {s} --familiar\n\n", .{ actual_port, password });
             }
         }
     } else {
         std.debug.print("\nTo join:\n", .{});
-        std.debug.print("  seance join localhost:{d} --password {s}\n\n", .{ actual_port, password });
+        std.debug.print("  seance join localhost:{d} --password {s}\n", .{ actual_port, password });
+        std.debug.print("  seance join localhost:{d} --password {s} --familiar\n\n", .{ actual_port, password });
     }
 
     std.debug.print("Waiting for participants... (type /quit to exit)\n\n", .{});
