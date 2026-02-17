@@ -25,6 +25,9 @@ seance host
 # Join a room
 seance join bore.pub:54321 --password fuzzy-planet-42
 
+# Join with an AI participant (Claude)
+seance join bore.pub:54321 --password fuzzy-planet-42 --familiar
+
 # Bot mode - HTTP API for programmatic access
 seance join bore.pub:54321 --password fuzzy-planet-42 --bot --api-port 9999
 ```
