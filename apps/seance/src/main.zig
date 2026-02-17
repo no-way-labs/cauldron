@@ -266,6 +266,7 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         std.debug.print("  POST /send       - send a message\n", .{});
         std.debug.print("  GET  /messages   - get new messages\n", .{});
         std.debug.print("  GET  /peers      - list participants\n", .{});
+        std.debug.print("  GET  /nick       - get bot's nick\n", .{});
         std.debug.print("  POST /quit       - disconnect\n\n", .{});
         try client.runBot(api_port);
     } else {

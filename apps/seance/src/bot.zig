@@ -45,16 +45,24 @@ pub const ApiServer = struct {
     fn handleConnection(self: *ApiServer, stream: std.net.Stream) void {
         defer stream.close();
 
+        std.debug.print("[bot-api] connection accepted\n", .{});
+
         var buffer: [8192]u8 = undefined;
         const bytes_read = stream.read(&buffer) catch return;
         if (bytes_read == 0) return;
+
+        std.debug.print("[bot-api] read {d} bytes\n", .{bytes_read});
 
         const request = parseRequest(buffer[0..bytes_read]) orelse {
             writeResponse(stream, 400, "Bad Request", "text/plain", "Invalid HTTP request");
             return;
         };
 
+        std.debug.print("[bot-api] {s} {s}\n", .{if (request.method == .GET) "GET" else "POST", request.path});
+
         self.routeRequest(stream, request);
+
+        std.debug.print("[bot-api] response sent\n", .{});
     }
 
     fn routeRequest(self: *ApiServer, stream: std.net.Stream, request: HttpRequest) void {
@@ -66,6 +74,8 @@ pub const ApiServer = struct {
             self.handlePeers(stream);
         } else if (request.method == .POST and std.mem.eql(u8, request.path, "/quit")) {
             self.handleQuit(stream);
+        } else if (request.method == .GET and std.mem.eql(u8, request.path, "/nick")) {
+            self.handleNick(stream);
         } else if (request.method == .GET and std.mem.eql(u8, request.path, "/health")) {
             writeResponse(stream, 200, "OK", "application/json", "{\"status\":\"ok\"}");
         } else {
@@ -146,6 +156,15 @@ pub const ApiServer = struct {
         writeResponse(stream, 200, "OK", "application/json", "{\"status\":\"disconnecting\"}");
         self.client.running.store(false, .monotonic);
     }
+
+    fn handleNick(self: *ApiServer, stream: std.net.Stream) void {
+        var buf: [256]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"nick\":\"{s}\"}}", .{self.client.nick}) catch {
+            writeResponse(stream, 500, "Internal Server Error", "text/plain", "Failed to format nick");
+            return;
+        };
+        writeResponse(stream, 200, "OK", "application/json", json);
+    }
 };
 
 const Method = enum { GET, POST };
@@ -214,4 +233,8 @@ fn writeResponse(stream: std.net.Stream, status: u16, status_text: []const u8, c
     if (body.len > 0) {
         stream.writeAll(body) catch return;
     }
+
+    // Shutdown write side to send FIN immediately
+    const sock: std.posix.socket_t = stream.handle;
+    std.posix.shutdown(sock, .send) catch {};
 }

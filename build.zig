@@ -88,8 +88,43 @@ pub fn build(b: *std.Build) void {
     });
     const run_seance_tests = b.addRunArtifact(seance_tests);
 
+    // Build familiar app
+    const familiar_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/familiar/src/main.zig"),
+    });
+
+    const familiar_exe = b.addExecutable(.{
+        .name = "familiar",
+        .root_module = familiar_module,
+    });
+    b.installArtifact(familiar_exe);
+
+    // Run step for familiar
+    const familiar_run = b.addRunArtifact(familiar_exe);
+    familiar_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        familiar_run.addArgs(args);
+    }
+    const familiar_run_step = b.step("familiar", "Run the familiar app");
+    familiar_run_step.dependOn(&familiar_run.step);
+
+    // Unit tests for familiar
+    const familiar_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/familiar/src/main.zig"),
+    });
+
+    const familiar_tests = b.addTest(.{
+        .root_module = familiar_test_module,
+    });
+    const run_familiar_tests = b.addRunArtifact(familiar_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mitt_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_seance_tests.step);
+    test_step.dependOn(&run_familiar_tests.step);
 }
