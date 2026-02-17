@@ -60,6 +60,27 @@ pub fn chat(
     system_prompt: ?[]const u8,
     messages: []const main_mod.ChatMessage,
 ) ![]u8 {
+    // Retry once on stale connection (server closed keep-alive after idle)
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        if (chatOnce(allocator, http_client, token, model, system_prompt, messages)) |response| {
+            return response;
+        } else |err| {
+            if (err == error.HttpConnectionClosing and attempt == 0) continue;
+            return err;
+        }
+    }
+    unreachable;
+}
+
+fn chatOnce(
+    allocator: std.mem.Allocator,
+    http_client: *std.http.Client,
+    token: []const u8,
+    model: []const u8,
+    system_prompt: ?[]const u8,
+    messages: []const main_mod.ChatMessage,
+) ![]u8 {
     // Build JSON request body
     const body = try buildRequestBody(allocator, model, system_prompt, messages);
     defer allocator.free(body);
