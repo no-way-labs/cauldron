@@ -351,49 +351,98 @@ pub const Server = struct {
 
     fn readHostStdin(self: *Server) void {
         const stdin = std.fs.File.stdin();
-        const is_tty = std.posix.isatty(stdin.handle);
-        var buffer: [4096]u8 = undefined;
 
+        // Enable raw mode so we own the input buffer
+        var original_termios: std.posix.termios = undefined;
+        const raw_mode = if (std.posix.isatty(stdin.handle)) blk: {
+            original_termios = std.posix.tcgetattr(stdin.handle) catch break :blk false;
+            var raw = original_termios;
+            raw.lflag.ECHO = false;
+            raw.lflag.ICANON = false;
+            raw.lflag.ISIG = false;
+            raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+            raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+            std.posix.tcsetattr(stdin.handle, .FLUSH, raw) catch break :blk false;
+            break :blk true;
+        } else false;
+        defer if (raw_mode) {
+            std.posix.tcsetattr(stdin.handle, .FLUSH, original_termios) catch {};
+        };
+
+        if (raw_mode) {
+            self.rawStdinLoop(stdin);
+        } else {
+            self.lineStdinLoop(stdin);
+        }
+    }
+
+    fn rawStdinLoop(self: *Server, stdin: std.fs.File) void {
+        var submit_buf: [4096]u8 = undefined;
+        while (self.running.load(.monotonic)) {
+            var byte_buf: [1]u8 = undefined;
+            const n = stdin.read(&byte_buf) catch break;
+            if (n == 0) break;
+            const byte = byte_buf[0];
+
+            switch (byte) {
+                3, 4 => { // Ctrl+C, Ctrl+D
+                    self.running.store(false, .monotonic);
+                    break;
+                },
+                '\r', '\n' => {
+                    const line = display.inputSubmit(&submit_buf);
+                    if (line.len == 0) continue;
+                    if (std.mem.eql(u8, line, "/quit")) {
+                        self.running.store(false, .monotonic);
+                        break;
+                    }
+                    self.sendHostMessage(line);
+                },
+                127, 8 => display.inputBackspace(),
+                21 => display.inputClear(), // Ctrl+U
+                else => {
+                    if (byte >= 32) display.inputChar(byte);
+                },
+            }
+        }
+    }
+
+    fn lineStdinLoop(self: *Server, stdin: std.fs.File) void {
+        var buffer: [4096]u8 = undefined;
         while (self.running.load(.monotonic)) {
             const bytes_read = stdin.read(&buffer) catch break;
             if (bytes_read == 0) break;
             const line = std.mem.trimRight(u8, buffer[0..bytes_read], "\n\r");
-
             const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
             if (trimmed.len == 0) continue;
-
             if (std.mem.eql(u8, trimmed, "/quit")) {
                 self.running.store(false, .monotonic);
                 break;
             }
-
-            // Erase the terminal-echoed input line
-            if (is_tty) {
-                std.debug.print("\x1b[A\x1b[2K\r", .{});
-            }
-
-            var encrypted = crypto.encrypt(self.allocator, trimmed, self.key) catch continue;
-            defer encrypted.deinit();
-
-            const frame = protocol.Frame{
-                .msg_type = .msg,
-                .timestamp = @as(u64, @intCast(std.time.timestamp())),
-                .sender = self.host_nick,
-                .nonce = encrypted.nonce,
-                .tag = encrypted.tag,
-                .ciphertext = encrypted.ciphertext,
-            };
-
-            // Broadcast to all peers
-            self.peers_mutex.lock();
-            for (self.peers.items) |peer| {
-                protocol.writeFrame(peer.stream, frame) catch {};
-            }
-            self.peers_mutex.unlock();
-
-            // Display own message locally
-            display.printMessage(frame.timestamp, self.host_nick, trimmed);
+            self.sendHostMessage(trimmed);
         }
+    }
+
+    fn sendHostMessage(self: *Server, text: []const u8) void {
+        var encrypted = crypto.encrypt(self.allocator, text, self.key) catch return;
+        defer encrypted.deinit();
+
+        const frame = protocol.Frame{
+            .msg_type = .msg,
+            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .sender = self.host_nick,
+            .nonce = encrypted.nonce,
+            .tag = encrypted.tag,
+            .ciphertext = encrypted.ciphertext,
+        };
+
+        self.peers_mutex.lock();
+        for (self.peers.items) |peer| {
+            protocol.writeFrame(peer.stream, frame) catch {};
+        }
+        self.peers_mutex.unlock();
+
+        display.printMessage(frame.timestamp, self.host_nick, text);
     }
 
     pub fn shutdown(self: *Server) void {

@@ -378,27 +378,63 @@ pub const Client = struct {
 
     fn stdinLoop(self: *Client) void {
         const stdin = std.fs.File.stdin();
-        const is_tty = std.posix.isatty(stdin.handle);
-        var buffer: [4096]u8 = undefined;
 
-        while (self.running.load(.monotonic)) {
-            const bytes_read = stdin.read(&buffer) catch break;
-            if (bytes_read == 0) break;
+        // Enable raw mode so we own the input buffer
+        var original_termios: std.posix.termios = undefined;
+        const raw_mode = if (std.posix.isatty(stdin.handle)) blk: {
+            original_termios = std.posix.tcgetattr(stdin.handle) catch break :blk false;
+            var raw = original_termios;
+            raw.lflag.ECHO = false;
+            raw.lflag.ICANON = false;
+            raw.lflag.ISIG = false;
+            raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+            raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+            std.posix.tcsetattr(stdin.handle, .FLUSH, raw) catch break :blk false;
+            break :blk true;
+        } else false;
+        defer if (raw_mode) {
+            std.posix.tcsetattr(stdin.handle, .FLUSH, original_termios) catch {};
+        };
 
-            const line = std.mem.trimRight(u8, buffer[0..bytes_read], "\n\r");
+        if (raw_mode) {
+            var submit_buf: [4096]u8 = undefined;
+            while (self.running.load(.monotonic)) {
+                var byte_buf: [1]u8 = undefined;
+                const n = stdin.read(&byte_buf) catch break;
+                if (n == 0) break;
+                const byte = byte_buf[0];
 
-            if (line.len == 0) continue;
-            if (std.mem.eql(u8, line, "/quit")) break;
-
-            // Erase the terminal-echoed input line
-            if (is_tty) {
-                std.debug.print("\x1b[A\x1b[2K\r", .{});
+                switch (byte) {
+                    3, 4 => break, // Ctrl+C, Ctrl+D
+                    '\r', '\n' => {
+                        const line = display.inputSubmit(&submit_buf);
+                        if (line.len == 0) continue;
+                        if (std.mem.eql(u8, line, "/quit")) break;
+                        self.sendMessage(line) catch {
+                            display.printStatus("Connection lost.");
+                            break;
+                        };
+                    },
+                    127, 8 => display.inputBackspace(),
+                    21 => display.inputClear(), // Ctrl+U
+                    else => {
+                        if (byte >= 32) display.inputChar(byte);
+                    },
+                }
             }
-
-            self.sendMessage(line) catch {
-                display.printStatus("Connection lost.");
-                break;
-            };
+        } else {
+            var buffer: [4096]u8 = undefined;
+            while (self.running.load(.monotonic)) {
+                const bytes_read = stdin.read(&buffer) catch break;
+                if (bytes_read == 0) break;
+                const line = std.mem.trimRight(u8, buffer[0..bytes_read], "\n\r");
+                if (line.len == 0) continue;
+                if (std.mem.eql(u8, line, "/quit")) break;
+                self.sendMessage(line) catch {
+                    display.printStatus("Connection lost.");
+                    break;
+                };
+            }
         }
     }
 

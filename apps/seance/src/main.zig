@@ -6,7 +6,7 @@ const crypto = @import("crypto.zig");
 const display = @import("display.zig");
 const id = @import("id.zig");
 
-pub const version = "0.2.4";
+pub const version = "0.2.5";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
