@@ -22,6 +22,7 @@ pub const ServerConfig = struct {
     local_only: bool = false,
     timeout_secs: u64 = 120,
     output_path: ?[]const u8 = null,
+    allowed_pubkeys: ?[][32]u8 = null,
 };
 
 pub const Server = struct {
@@ -52,6 +53,7 @@ pub const Server = struct {
         host_nick: []const u8,
         question: []const u8,
         options: []const []const u8,
+        keypair: crypto.KeyPair,
     ) !Server {
         const address = try std.net.Address.parseIp("0.0.0.0", config.port);
         const listener = try address.listen(.{
@@ -70,7 +72,7 @@ pub const Server = struct {
             .question = question,
             .options = options,
             .session_id = session_id,
-            .host_keypair = crypto.generateKeyPair(),
+            .host_keypair = keypair,
             .voters = try std.ArrayList(Voter).initCapacity(allocator, 0),
             .voters_mutex = std.Thread.Mutex{},
             .phase = std.atomic.Value(u8).init(@intFromEnum(protocol.Phase.lobby)),
@@ -222,6 +224,20 @@ pub const Server = struct {
             switch (frame.msg_type) {
                 .pubkey => {
                     if (plaintext.len == 32) {
+                        // Check against covenant roster if restricted
+                        if (self.config.allowed_pubkeys) |allowed| {
+                            var found = false;
+                            for (allowed) |pk| {
+                                if (std.mem.eql(u8, plaintext[0..32], &pk)) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                display.printStatus("Rejected voter: not in covenant roster.");
+                                return; // disconnect
+                            }
+                        }
                         self.voters_mutex.lock();
                         for (self.voters.items) |*voter| {
                             if (voter.slot_id == slot_id) {

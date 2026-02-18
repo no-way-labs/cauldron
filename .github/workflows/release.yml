@@ -7,6 +7,7 @@ on:
       - 'seance-v*'
       - 'familiar-v*'
       - 'omen-v*'
+      - 'covenant-v*'
   workflow_dispatch:
     inputs:
       version:
@@ -88,6 +89,23 @@ jobs:
             os: ubuntu-latest
             zig_target: aarch64-linux
             artifact: omen-linux-aarch64
+          # covenant
+          - app: covenant
+            os: macos-latest
+            zig_target: aarch64-macos
+            artifact: covenant-macos-aarch64
+          - app: covenant
+            os: macos-latest
+            zig_target: x86_64-macos
+            artifact: covenant-macos-x86_64
+          - app: covenant
+            os: ubuntu-latest
+            zig_target: x86_64-linux
+            artifact: covenant-linux-x86_64
+          - app: covenant
+            os: ubuntu-latest
+            zig_target: aarch64-linux
+            artifact: covenant-linux-aarch64
 
     steps:
       - name: Check if this app should build
@@ -101,7 +119,9 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == omen-v* && "$APP" == "omen" ]]; then
             echo "should_build=true" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == v* && ! "$TAG" == seance-v* && ! "$TAG" == familiar-v* && ! "$TAG" == omen-v* && "$APP" == "mitt" ]]; then
+          elif [[ "$TAG" == covenant-v* && "$APP" == "covenant" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == v* && ! "$TAG" == seance-v* && ! "$TAG" == familiar-v* && ! "$TAG" == omen-v* && ! "$TAG" == covenant-v* && "$APP" == "mitt" ]]; then
             echo "should_build=true" >> $GITHUB_OUTPUT
           else
             echo "should_build=false" >> $GITHUB_OUTPUT
@@ -168,6 +188,9 @@ jobs:
           elif [[ "$TAG" == omen-v* ]]; then
             echo "name=omen" >> $GITHUB_OUTPUT
             echo "version=${TAG#omen-}" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == covenant-v* ]]; then
+            echo "name=covenant" >> $GITHUB_OUTPUT
+            echo "version=${TAG#covenant-}" >> $GITHUB_OUTPUT
           else
             echo "name=mitt" >> $GITHUB_OUTPUT
             echo "version=$TAG" >> $GITHUB_OUTPUT
@@ -221,6 +244,19 @@ jobs:
 
           ## SHA256 Checksums
           EOF
+          elif [ "$APP" = "covenant" ]; then
+            cat > release_notes.md << 'EOF'
+          # covenant ${{ github.ref_name }}
+
+          Membership signing ceremony CLI. No accounts, no history, no cloud.
+
+          ## Installation
+
+          ### Manual Installation
+          Download the appropriate binary for your platform below and extract it.
+
+          ## SHA256 Checksums
+          EOF
           else
             cat > release_notes.md << 'EOF'
           # mitt ${{ github.ref_name }}
@@ -257,7 +293,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout homebrew tap
-        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen'
+        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen' && steps.app.outputs.name != 'covenant'
         uses: actions/checkout@v4
         with:
           repository: no-way-labs/homebrew-cauldron
@@ -265,7 +301,7 @@ jobs:
           path: homebrew-tap
 
       - name: Update Homebrew formula
-        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen'
+        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen' && steps.app.outputs.name != 'covenant'
         run: |
           APP="${{ steps.app.outputs.name }}"
           TAG="${{ github.ref_name }}"
@@ -298,7 +334,7 @@ jobs:
           fi
 
       - name: Push updated formula
-        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen'
+        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen' && steps.app.outputs.name != 'covenant'
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"

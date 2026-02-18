@@ -5,6 +5,8 @@ const tunnel = @import("tunnel.zig");
 const crypto = @import("crypto.zig");
 const display = @import("display.zig");
 const id = @import("id.zig");
+const verify_mod = @import("verify.zig");
+const artifact_mod = @import("artifact.zig");
 
 pub const version = "0.1.0";
 
@@ -24,7 +26,7 @@ pub fn main() !void {
     const command = args[1];
 
     if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
-        std.debug.print("omen {s}\n", .{version});
+        std.debug.print("covenant {s}\n", .{version});
         return;
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage();
@@ -35,6 +37,8 @@ pub fn main() !void {
         try handleJoin(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "verify")) {
         try handleVerify(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "members")) {
+        try handleMembers(allocator, args[2..]);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();
@@ -44,31 +48,30 @@ pub fn main() !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\Usage: omen <command> [options]
+        \\Usage: covenant <command> [options]
         \\
         \\Commands:
-        \\  host <question>       Host a vote
-        \\  join <host:port>      Join a vote
-        \\  verify <file.json>    Verify a vote artifact
+        \\  host <group-name>     Host a signing ceremony
+        \\  join <host:port>      Join a signing ceremony
+        \\  verify <file.json>    Verify a covenant artifact
+        \\  members <file.json>   List members in a covenant
         \\
         \\Host options:
-        \\  --options <a,b,c>      Comma-separated options (default: yes,no)
+        \\  --identity <phrase>    Identity passphrase (required)
         \\  --output <file>        Save artifact to file (default: stdout)
         \\  --port <port>          Local port (default: auto)
         \\  --bore-port <port>     Request specific bore port
         \\  --local                Skip tunnel, local only
         \\  --password <pass>      Room password (default: auto-generated)
         \\  --nick <name>          Your display name (default: auto-generated)
-        \\  --max-voters <n>       Max participants (default: 32)
-        \\  --roster <file.json>   Restrict to covenant members
-        \\  --identity <phrase>    Identity passphrase (required with --roster)
+        \\  --max-members <n>      Max participants (default: 32)
         \\
         \\Join options:
         \\  --password <pass>      Room password (required)
+        \\  --identity <phrase>    Identity passphrase (required)
         \\  --nick <name>          Your display name (default: auto-generated)
         \\  --output <file>        Save artifact to file (default: stdout)
         \\  --timeout <secs>       Connection timeout (default: 30)
-        \\  --identity <phrase>    Identity passphrase (required for restricted votes)
         \\
     , .{});
 }
@@ -79,12 +82,10 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var local_only = false;
     var password_opt: ?[]const u8 = null;
     var nick_opt: ?[]const u8 = null;
-    var max_voters: u8 = 32;
-    var question_opt: ?[]const u8 = null;
-    var options_str: ?[]const u8 = null;
-    var output_path: ?[]const u8 = null;
-    var roster_path: ?[]const u8 = null;
     var identity_opt: ?[]const u8 = null;
+    var max_members: u8 = 32;
+    var group_name_opt: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -109,78 +110,36 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else if (std.mem.eql(u8, arg, "--nick") and i + 1 < args.len) {
             i += 1;
             nick_opt = args[i];
-        } else if (std.mem.eql(u8, arg, "--max-voters") and i + 1 < args.len) {
-            i += 1;
-            max_voters = std.fmt.parseInt(u8, args[i], 10) catch {
-                std.debug.print("Error: max-voters must be a valid number\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, arg, "--options") and i + 1 < args.len) {
-            i += 1;
-            options_str = args[i];
-        } else if (std.mem.eql(u8, arg, "--output") and i + 1 < args.len) {
-            i += 1;
-            output_path = args[i];
-        } else if (std.mem.eql(u8, arg, "--roster") and i + 1 < args.len) {
-            i += 1;
-            roster_path = args[i];
         } else if (std.mem.eql(u8, arg, "--identity") and i + 1 < args.len) {
             i += 1;
             identity_opt = args[i];
-        } else if (!std.mem.startsWith(u8, arg, "--") and question_opt == null) {
-            question_opt = arg;
+        } else if (std.mem.eql(u8, arg, "--max-members") and i + 1 < args.len) {
+            i += 1;
+            max_members = std.fmt.parseInt(u8, args[i], 10) catch {
+                std.debug.print("Error: max-members must be a valid number\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--output") and i + 1 < args.len) {
+            i += 1;
+            output_path = args[i];
+        } else if (!std.mem.startsWith(u8, arg, "--") and group_name_opt == null) {
+            group_name_opt = arg;
         }
     }
 
-    const question = question_opt orelse {
-        std.debug.print("Error: question is required\n", .{});
-        std.debug.print("Usage: omen host \"Your question?\" [--options a,b,c]\n", .{});
+    const group_name = group_name_opt orelse {
+        std.debug.print("Error: group name is required\n", .{});
+        std.debug.print("Usage: covenant host \"Group Name\" --identity \"my passphrase\"\n", .{});
         std.process.exit(1);
     };
 
-    // Parse options
-    var options_list = std.ArrayList([]const u8).initCapacity(allocator, 0) catch unreachable;
-    defer options_list.deinit(allocator);
-
-    if (options_str) |opts| {
-        var iter = std.mem.tokenizeScalar(u8, opts, ',');
-        while (iter.next()) |opt| {
-            const trimmed = std.mem.trim(u8, opt, &std.ascii.whitespace);
-            if (trimmed.len > 0) {
-                options_list.append(allocator, trimmed) catch unreachable;
-            }
-        }
-    } else {
-        // Default: yes/no
-        options_list.append(allocator, "yes") catch unreachable;
-        options_list.append(allocator, "no") catch unreachable;
-    }
-
-    if (options_list.items.len < 2) {
-        std.debug.print("Error: need at least 2 options\n", .{});
+    const identity_phrase = identity_opt orelse {
+        std.debug.print("Error: --identity is required\n", .{});
+        std.debug.print("Usage: covenant host \"Group Name\" --identity \"my passphrase\"\n", .{});
         std.process.exit(1);
-    }
+    };
 
-    // Load covenant roster if provided
-    var allowed_pubkeys: ?[][32]u8 = null;
-    defer if (allowed_pubkeys) |keys| allocator.free(keys);
-
-    if (roster_path) |rpath| {
-        if (identity_opt == null) {
-            std.debug.print("Error: --identity is required when using --roster\n", .{});
-            std.process.exit(1);
-        }
-        allowed_pubkeys = loadCovenantPubkeys(allocator, rpath) catch |err| {
-            std.debug.print("Error: cannot load roster {s}: {}\n", .{ rpath, err });
-            std.process.exit(1);
-        };
-    }
-
-    // Derive identity keypair or generate ephemeral
-    const host_keypair = if (identity_opt) |phrase|
-        crypto.deriveIdentity(phrase)
-    else
-        crypto.generateKeyPair();
+    const identity = crypto.deriveIdentity(identity_phrase);
 
     // Generate or use password
     const password = if (password_opt) |p|
@@ -200,22 +159,21 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     var srv = try server_mod.Server.init(allocator, .{
         .port = port,
-        .max_voters = max_voters,
+        .max_members = max_members,
         .local_only = local_only,
         .output_path = output_path,
-        .allowed_pubkeys = allowed_pubkeys,
-    }, key, nick, question, options_list.items, host_keypair);
+    }, key, nick, group_name, identity);
     defer srv.shutdown();
 
-    // Get the actual port the server bound to
     const actual_port = srv.listener.listen_address.getPort();
 
-    // Print room info (all to stderr)
+    // Print room info
     display.printBanner(version);
-    display.printBallot(question, options_list.items);
-    if (roster_path) |rpath| {
-        std.debug.print("\x1b[38;5;245mRoster:\x1b[0m {s} ({d} members)\n", .{ rpath, if (allowed_pubkeys) |k| k.len else 0 });
-    }
+    display.printGroupName(group_name);
+
+    // Show identity pubkey
+    const pk = crypto.publicKeyBytes(identity);
+    std.debug.print("\x1b[38;5;245mIdentity:\x1b[0m {x:0>2}{x:0>2}{x:0>2}{x:0>2}...\n", .{ pk[0], pk[1], pk[2], pk[3] });
     std.debug.print("\x1b[38;5;245mPassword:\x1b[0m {s}\n", .{password});
     std.debug.print("\x1b[38;5;245mNick:\x1b[0m {s}\n", .{nick});
     std.debug.print("\x1b[38;5;245mLocal:\x1b[0m localhost:{d}\n", .{actual_port});
@@ -235,7 +193,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             std.debug.print("\n", .{});
 
             std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
-            std.debug.print("  \x1b[38;5;240momen join {s}:{d} --password {s}\x1b[0m\n\n", .{
+            std.debug.print("  \x1b[38;5;240mcovenant join {s}:{d} --password {s} --identity \"<passphrase>\"\x1b[0m\n\n", .{
                 tun.public_host, tun.public_port, password,
             });
         } else |err| {
@@ -246,45 +204,44 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     tun_opt.?.startMonitor();
                     std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}\n", .{ tun.public_host, tun.public_port });
                     std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
-                    std.debug.print("  \x1b[38;5;240momen join {s}:{d} --password {s}\x1b[0m\n\n", .{
+                    std.debug.print("  \x1b[38;5;240mcovenant join {s}:{d} --password {s} --identity \"<passphrase>\"\x1b[0m\n\n", .{
                         tun.public_host, tun.public_port, password,
                     });
                 } else |retry_err| {
                     std.debug.print("\x1b[38;5;240mWarning: tunnel failed ({any}), local only.\x1b[0m\n", .{retry_err});
                     std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
-                    std.debug.print("  \x1b[38;5;240momen join localhost:{d} --password {s}\x1b[0m\n\n", .{ actual_port, password });
+                    std.debug.print("  \x1b[38;5;240mcovenant join localhost:{d} --password {s} --identity \"<passphrase>\"\x1b[0m\n\n", .{ actual_port, password });
                 }
             } else {
                 std.debug.print("\x1b[38;5;240mWarning: tunnel failed ({any}), local only.\x1b[0m\n", .{err});
                 std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
-                std.debug.print("  \x1b[38;5;240momen join localhost:{d} --password {s}\x1b[0m\n\n", .{ actual_port, password });
+                std.debug.print("  \x1b[38;5;240mcovenant join localhost:{d} --password {s} --identity \"<passphrase>\"\x1b[0m\n\n", .{ actual_port, password });
             }
         }
     } else {
         std.debug.print("\n\x1b[38;5;245mTo join:\x1b[0m\n", .{});
-        std.debug.print("  \x1b[38;5;240momen join localhost:{d} --password {s}\x1b[0m\n\n", .{ actual_port, password });
+        std.debug.print("  \x1b[38;5;240mcovenant join localhost:{d} --password {s} --identity \"<passphrase>\"\x1b[0m\n\n", .{ actual_port, password });
     }
 
     try srv.run();
 
-    std.debug.print("\nVote complete.\n", .{});
+    std.debug.print("\nCeremony complete.\n", .{});
 
-    // Exit explicitly — the stdin reader thread is still blocked on read()
     srv.shutdown();
     std.process.exit(0);
 }
 
 fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        std.debug.print("Usage: omen join <host:port> --password <pass>\n", .{});
+        std.debug.print("Usage: covenant join <host:port> --password <pass> --identity \"<passphrase>\"\n", .{});
         std.process.exit(1);
     }
 
     const target = args[0];
     var password_opt: ?[]const u8 = null;
     var nick_opt: ?[]const u8 = null;
+    var identity_opt: ?[]const u8 = null;
     var join_output_path: ?[]const u8 = null;
-    var join_identity_opt: ?[]const u8 = null;
     var timeout_secs: u64 = 30;
 
     var i: usize = 1;
@@ -296,12 +253,12 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else if (std.mem.eql(u8, arg, "--nick") and i + 1 < args.len) {
             i += 1;
             nick_opt = args[i];
+        } else if (std.mem.eql(u8, arg, "--identity") and i + 1 < args.len) {
+            i += 1;
+            identity_opt = args[i];
         } else if (std.mem.eql(u8, arg, "--output") and i + 1 < args.len) {
             i += 1;
             join_output_path = args[i];
-        } else if (std.mem.eql(u8, arg, "--identity") and i + 1 < args.len) {
-            i += 1;
-            join_identity_opt = args[i];
         } else if (std.mem.eql(u8, arg, "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout_secs = std.fmt.parseInt(u64, args[i], 10) catch {
@@ -316,14 +273,14 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         std.process.exit(1);
     }
 
+    const identity_phrase = identity_opt orelse {
+        std.debug.print("Error: --identity is required\n", .{});
+        std.process.exit(1);
+    };
+
     const password = password_opt.?;
     const key = crypto.deriveKey(password);
-
-    // Derive identity keypair or generate ephemeral
-    const join_keypair = if (join_identity_opt) |phrase|
-        crypto.deriveIdentity(phrase)
-    else
-        crypto.generateKeyPair();
+    const identity = crypto.deriveIdentity(identity_phrase);
 
     // Parse target host:port
     const colon_pos = std.mem.lastIndexOfScalar(u8, target, ':') orelse {
@@ -344,26 +301,29 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer allocator.free(nick);
 
     display.printBanner(version);
-    std.debug.print("\x1b[38;5;245mConnected as:\x1b[0m {s}\n", .{nick});
 
-    var client = client_mod.Client.connect(allocator, host, port, key, join_keypair, .{
+    const pk = crypto.publicKeyBytes(identity);
+    std.debug.print("\x1b[38;5;245mIdentity:\x1b[0m {x:0>2}{x:0>2}{x:0>2}{x:0>2}...\n", .{ pk[0], pk[1], pk[2], pk[3] });
+    std.debug.print("\x1b[38;5;245mNick:\x1b[0m {s}\n", .{nick});
+
+    var client = client_mod.Client.connect(allocator, host, port, key, identity, .{
         .nick = nick,
         .timeout_secs = timeout_secs,
         .output_path = join_output_path,
     }) catch |err| {
-        std.debug.print("Failed to join vote: {}\n", .{err});
+        std.debug.print("Failed to join ceremony: {}\n", .{err});
         std.process.exit(2);
     };
     defer client.disconnect();
 
     try client.run();
 
-    std.debug.print("\nVote complete.\n", .{});
+    std.debug.print("\nCeremony complete.\n", .{});
 }
 
 fn handleVerify(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 1) {
-        std.debug.print("Usage: omen verify <artifact.json>\n", .{});
+        std.debug.print("Usage: covenant verify <artifact.json>\n", .{});
         std.process.exit(1);
     }
 
@@ -380,82 +340,76 @@ fn handleVerify(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
     };
     defer allocator.free(content);
 
-    // For now, just verify the JSON is parseable and print basic info
-    // Full verification would re-check all commitments and reveals
-    std.debug.print("Artifact: {s}\n", .{file_path});
-    std.debug.print("Size: {d} bytes\n", .{content.len});
-    std.debug.print("Verification: basic structure OK\n", .{});
+    var result = verify_mod.verifyCovenant(allocator, content) catch |err| {
+        std.debug.print("\x1b[38;5;196mVerification FAILED: {}\x1b[0m\n", .{err});
+        std.process.exit(1);
+    };
+    defer verify_mod.freeVerifyResult(allocator, &result);
 
-    // TODO: full cryptographic verification
-    // - parse commitments + reveals from JSON
-    // - verify bijection (each reveal opens exactly one commitment)
-    // - verify Ed25519 signatures on commitments
-    // - verify host signature on artifact
-    // - recompute tally and compare
-}
+    std.debug.print("\n\x1b[38;5;45mCovenant Verification\x1b[0m\n\n", .{});
+    std.debug.print("\x1b[38;5;245mFile:\x1b[0m      {s}\n", .{file_path});
+    if (result.group_name) |name| {
+        std.debug.print("\x1b[38;5;245mGroup:\x1b[0m     {s}\n", .{name});
+    }
+    std.debug.print("\x1b[38;5;245mMembers:\x1b[0m   {d}\n", .{result.member_count});
 
-/// Load pubkeys from a covenant JSON artifact.
-fn loadCovenantPubkeys(allocator: std.mem.Allocator, path: []const u8) ![][32]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(content);
-
-    // Extract pubkeys from members array
-    var pubkeys = try std.ArrayList([32]u8).initCapacity(allocator, 0);
-    errdefer pubkeys.deinit(allocator);
-
-    // Find members array
-    const members_start = std.mem.indexOf(u8, content, "\"members\":[") orelse return error.InvalidCovenant;
-    var pos = members_start + "\"members\":[".len;
-
-    while (pos < content.len) {
-        // Skip whitespace/commas
-        while (pos < content.len and (content[pos] == ' ' or content[pos] == ',' or content[pos] == '\n' or content[pos] == '\r')) : (pos += 1) {}
-        if (pos >= content.len or content[pos] == ']') break;
-        if (content[pos] != '{') break;
-
-        // Find end of member object
-        const obj_start = pos;
-        var depth: usize = 0;
-        while (pos < content.len) : (pos += 1) {
-            if (content[pos] == '{') depth += 1;
-            if (content[pos] == '}') {
-                depth -= 1;
-                if (depth == 0) {
-                    pos += 1;
-                    break;
-                }
-            }
-        }
-        const obj = content[obj_start..pos];
-
-        // Extract pubkey field
-        const pk_needle = "\"pubkey\":\"";
-        const pk_start = (std.mem.indexOf(u8, obj, pk_needle) orelse continue) + pk_needle.len;
-        var pk_end = pk_start;
-        while (pk_end < obj.len and obj[pk_end] != '"') : (pk_end += 1) {}
-        const pk_hex = obj[pk_start..pk_end];
-
-        if (pk_hex.len != 64) continue;
-
-        var pubkey: [32]u8 = undefined;
-        for (0..32) |j| {
-            pubkey[j] = @as(u8, hexVal(pk_hex[j * 2]) orelse continue) << 4 | @as(u8, hexVal(pk_hex[j * 2 + 1]) orelse continue);
-        }
-        try pubkeys.append(allocator, pubkey);
+    // Show each member's verification status
+    for (result.members) |m| {
+        const status = if (m.valid) "\x1b[38;5;82m\xe2\x9c\x93\x1b[0m" else "\x1b[38;5;196m\xe2\x9c\x97\x1b[0m";
+        std.debug.print("  {s} {s}  \x1b[38;5;240m{x:0>2}{x:0>2}{x:0>2}{x:0>2}...\x1b[0m\n", .{
+            status, m.nick, m.pubkey[0], m.pubkey[1], m.pubkey[2], m.pubkey[3],
+        });
     }
 
-    if (pubkeys.items.len == 0) return error.NoPubkeysFound;
-    return try pubkeys.toOwnedSlice(allocator);
+    std.debug.print("\n", .{});
+    if (result.valid) {
+        std.debug.print("\x1b[38;5;82mAll signatures valid.\x1b[0m\n\n", .{});
+    } else {
+        std.debug.print("\x1b[38;5;196mSome signatures INVALID.\x1b[0m\n\n", .{});
+        std.process.exit(1);
+    }
 }
 
-fn hexVal(c: u8) ?u4 {
-    return switch (c) {
-        '0'...'9' => @intCast(c - '0'),
-        'a'...'f' => @intCast(c - 'a' + 10),
-        'A'...'F' => @intCast(c - 'A' + 10),
-        else => null,
+fn handleMembers(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    if (args.len < 1) {
+        std.debug.print("Usage: covenant members <artifact.json>\n", .{});
+        std.process.exit(1);
+    }
+
+    const file_path = args[0];
+    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        std.debug.print("Error: cannot open {s}: {}\n", .{ file_path, err });
+        std.process.exit(1);
     };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        std.debug.print("Error: cannot read {s}: {}\n", .{ file_path, err });
+        std.process.exit(1);
+    };
+    defer allocator.free(content);
+
+    var result = verify_mod.verifyCovenant(allocator, content) catch |err| {
+        std.debug.print("Error: cannot parse covenant: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer verify_mod.freeVerifyResult(allocator, &result);
+
+    if (result.group_name) |name| {
+        std.debug.print("\n\x1b[38;5;45m{s}\x1b[0m  ({d} members)\n\n", .{ name, result.member_count });
+    } else {
+        std.debug.print("\nCovenant ({d} members)\n\n", .{result.member_count});
+    }
+
+    for (result.members) |m| {
+        // Full pubkey hex
+        var pk_hex: [64]u8 = undefined;
+        const charset = "0123456789abcdef";
+        for (0..32) |j| {
+            pk_hex[j * 2] = charset[m.pubkey[j] >> 4];
+            pk_hex[j * 2 + 1] = charset[m.pubkey[j] & 0x0f];
+        }
+        std.debug.print("  {s}  \x1b[38;5;240m{s}\x1b[0m\n", .{ m.nick, &pk_hex });
+    }
+    std.debug.print("\n", .{});
 }

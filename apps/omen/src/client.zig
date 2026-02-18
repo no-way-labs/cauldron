@@ -35,7 +35,7 @@ pub const Client = struct {
     // Output
     output_path: ?[]const u8,
 
-    pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16, key: [32]u8, config: ClientConfig) !Client {
+    pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16, key: [32]u8, keypair: crypto.KeyPair, config: ClientConfig) !Client {
         const stream = try std.net.tcpConnectToHost(allocator, host, port);
 
         // Send JOIN frame with MAGIC
@@ -57,7 +57,7 @@ pub const Client = struct {
             .stream = stream,
             .key = key,
             .nick = config.nick,
-            .keypair = crypto.generateKeyPair(),
+            .keypair = keypair,
             .running = std.atomic.Value(bool).init(true),
             .session_id = [_]u8{0} ** 32,
             .question = null,

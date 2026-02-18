@@ -13,7 +13,7 @@ pub const EncryptedData = struct {
 
 pub fn deriveKey(password: []const u8) [32]u8 {
     var key: [32]u8 = undefined;
-    const salt = "omen-v1-salt---!";
+    const salt = "covenant-v1-salt";
     var salt_bytes: [16]u8 = undefined;
     @memcpy(&salt_bytes, salt);
 
@@ -99,20 +99,15 @@ pub fn decryptRaw(allocator: std.mem.Allocator, nonce: [24]u8, tag: [16]u8, ciph
     return plaintext;
 }
 
-// --- Omen-specific crypto ---
+// --- Covenant-specific crypto ---
 
 const Blake2b256 = std.crypto.hash.blake2.Blake2b256;
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const KeyPair = Ed25519.KeyPair;
 
-/// Generate an ephemeral Ed25519 keypair for this session.
-pub fn generateKeyPair() KeyPair {
-    return Ed25519.KeyPair.generate();
-}
-
 /// Derive a deterministic Ed25519 keypair from a passphrase.
-/// Same derivation as covenant — same passphrase yields same pubkey.
+/// Same passphrase always yields the same keypair.
 pub fn deriveIdentity(passphrase: []const u8) KeyPair {
     var seed: [32]u8 = undefined;
     var hasher = Blake2b256.init(.{});
@@ -120,47 +115,22 @@ pub fn deriveIdentity(passphrase: []const u8) KeyPair {
     hasher.update(passphrase);
     hasher.final(&seed);
     return Ed25519.KeyPair.generateDeterministic(seed) catch {
+        // Identity element is astronomically unlikely from BLAKE2b output
         @panic("identity element hit in key derivation");
     };
 }
 
-/// Compute BLAKE2b commitment: H(vote_index || blinding_factor)
-pub fn makeCommitment(vote_index: u8, blinding_factor: [32]u8) [32]u8 {
-    var hasher = Blake2b256.init(.{});
-    hasher.update(&[_]u8{vote_index});
-    hasher.update(&blinding_factor);
-    var out: [32]u8 = undefined;
-    hasher.final(&out);
-    return out;
+/// Generate an ephemeral Ed25519 keypair for this session.
+pub fn generateKeyPair() KeyPair {
+    return Ed25519.KeyPair.generate();
 }
 
-/// Compute roster hash: BLAKE2b(sorted(slot_id || nick_len || nick || pubkey) for each peer)
-pub fn computeRosterHash(peers: []const @import("protocol.zig").PeerInfo) [32]u8 {
-    var hasher = Blake2b256.init(.{});
-    for (peers) |peer| {
-        hasher.update(&[_]u8{peer.slot_id});
-        hasher.update(&[_]u8{@intCast(peer.nick.len)});
-        hasher.update(peer.nick);
-        hasher.update(&peer.pubkey);
-    }
-    var out: [32]u8 = undefined;
-    hasher.final(&out);
-    return out;
+/// Get public key bytes from a KeyPair
+pub fn publicKeyBytes(key_pair: KeyPair) [32]u8 {
+    return key_pair.public_key.toBytes();
 }
 
-/// Compute commit set hash: BLAKE2b(sorted commitments)
-pub fn computeCommitSetHash(commitments: []const @import("protocol.zig").Commitment) [32]u8 {
-    var hasher = Blake2b256.init(.{});
-    for (commitments) |c| {
-        hasher.update(&[_]u8{c.slot_id});
-        hasher.update(&c.commitment);
-    }
-    var out: [32]u8 = undefined;
-    hasher.final(&out);
-    return out;
-}
-
-/// Sign data with Ed25519. Returns signature as [64]u8.
+/// Sign data with Ed25519.
 pub fn sign(message: []const u8, key_pair: KeyPair) [64]u8 {
     const sig = key_pair.sign(message, null) catch return [_]u8{0} ** 64;
     return sig.toBytes();
@@ -174,25 +144,27 @@ pub fn verify(sig_bytes: [64]u8, message: []const u8, public_key_bytes: [32]u8) 
     return true;
 }
 
-/// Sign a commitment: Ed25519.sign(roster_hash || commitment)
-pub fn signCommitment(roster_hash: [32]u8, commitment_val: [32]u8, key_pair: KeyPair) [64]u8 {
-    var msg: [64]u8 = undefined;
-    @memcpy(msg[0..32], &roster_hash);
-    @memcpy(msg[32..64], &commitment_val);
-    return sign(&msg, key_pair);
+/// Compute roster hash: BLAKE2b(sorted members by pubkey)
+pub fn computeRosterHash(members: []const @import("protocol.zig").MemberInfo) [32]u8 {
+    var hasher = Blake2b256.init(.{});
+    for (members) |m| {
+        hasher.update(&m.pubkey);
+        hasher.update(&[_]u8{@intCast(m.nick.len)});
+        hasher.update(m.nick);
+    }
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
 }
 
-/// Verify a commitment signature
-pub fn verifyCommitmentSig(roster_hash: [32]u8, commitment_val: [32]u8, sig: [64]u8, public_key: [32]u8) bool {
-    var msg: [64]u8 = undefined;
-    @memcpy(msg[0..32], &roster_hash);
-    @memcpy(msg[32..64], &commitment_val);
-    return verify(sig, &msg, public_key);
+/// Sign a roster hash with identity key
+pub fn signRoster(roster_hash: [32]u8, key_pair: KeyPair) [64]u8 {
+    return sign(&roster_hash, key_pair);
 }
 
-/// Get public key bytes from a KeyPair
-pub fn publicKeyBytes(key_pair: KeyPair) [32]u8 {
-    return key_pair.public_key.toBytes();
+/// Verify a roster hash signature
+pub fn verifyRosterSig(roster_hash: [32]u8, sig: [64]u8, public_key: [32]u8) bool {
+    return verify(sig, &roster_hash, public_key);
 }
 
 test "encrypt and decrypt roundtrip" {
@@ -210,28 +182,20 @@ test "encrypt and decrypt roundtrip" {
     try std.testing.expectEqualStrings(plaintext, decrypted);
 }
 
-test "commitment scheme" {
-    const vote_index: u8 = 2;
-    var blinding: [32]u8 = undefined;
-    std.crypto.random.bytes(&blinding);
+test "deriveIdentity is deterministic" {
+    const kp1 = deriveIdentity("my secret phrase");
+    const kp2 = deriveIdentity("my secret phrase");
+    try std.testing.expectEqual(publicKeyBytes(kp1), publicKeyBytes(kp2));
 
-    const commitment_val = makeCommitment(vote_index, blinding);
-
-    // Same inputs produce same commitment
-    const commitment2 = makeCommitment(vote_index, blinding);
-    try std.testing.expectEqual(commitment_val, commitment2);
-
-    // Different inputs produce different commitment
-    const commitment3 = makeCommitment(1, blinding);
-    try std.testing.expect(!std.mem.eql(u8, &commitment_val, &commitment3));
+    // Different passphrase gives different key
+    const kp3 = deriveIdentity("different phrase");
+    try std.testing.expect(!std.mem.eql(u8, &publicKeyBytes(kp1), &publicKeyBytes(kp3)));
 }
 
 test "Ed25519 sign and verify" {
-    const kp = generateKeyPair();
+    const kp = deriveIdentity("test");
     const msg = "test message";
     const sig = sign(msg, kp);
     try std.testing.expect(verify(sig, msg, publicKeyBytes(kp)));
-
-    // Wrong message fails
     try std.testing.expect(!verify(sig, "wrong", publicKeyBytes(kp)));
 }

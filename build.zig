@@ -167,10 +167,45 @@ pub fn build(b: *std.Build) void {
     });
     const run_omen_tests = b.addRunArtifact(omen_tests);
 
+    // Build covenant app
+    const covenant_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/covenant/src/main.zig"),
+    });
+
+    const covenant_exe = b.addExecutable(.{
+        .name = "covenant",
+        .root_module = covenant_module,
+    });
+    b.installArtifact(covenant_exe);
+
+    // Run step for covenant
+    const covenant_run = b.addRunArtifact(covenant_exe);
+    covenant_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        covenant_run.addArgs(args);
+    }
+    const covenant_run_step = b.step("covenant", "Run the covenant app");
+    covenant_run_step.dependOn(&covenant_run.step);
+
+    // Unit tests for covenant
+    const covenant_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/covenant/src/main.zig"),
+    });
+
+    const covenant_tests = b.addTest(.{
+        .root_module = covenant_test_module,
+    });
+    const run_covenant_tests = b.addRunArtifact(covenant_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mitt_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_seance_tests.step);
     test_step.dependOn(&run_familiar_tests.step);
     test_step.dependOn(&run_omen_tests.step);
+    test_step.dependOn(&run_covenant_tests.step);
 }

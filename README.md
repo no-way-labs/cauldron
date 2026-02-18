@@ -54,6 +54,25 @@ omen verify result.json
 
 **Security**: commit-reveal protocol with BLAKE2b commitments, Ed25519 signatures, and Fisher-Yates shuffled reveals. Every participant verifies all signatures, checks the bijection between reveals and commitments, and tallies independently. The host cannot forge, alter, add, or remove votes without detection.
 
+### covenant - membership signing ceremony
+One person hosts a signing ceremony for a group, others join with their identity passphrase. Everyone exchanges public keys and co-signs the roster. The output is a multi-signed JSON artifact proving mutual agreement on membership.
+
+```bash
+# Host a signing ceremony
+covenant host "Engineering Team" --identity "my secret phrase"
+
+# Join a ceremony
+covenant join bore.pub:54321 --password misty-raven-42 --identity "my secret phrase"
+
+# Verify a saved covenant
+covenant verify team.json
+
+# List members
+covenant members team.json
+```
+
+**Security**: deterministic Ed25519 identity from passphrase (BLAKE2b seed derivation), mutual attestation (every member signs the same roster hash), tamper-evident (modifying any member invalidates all signatures). No files, no accounts — your identity lives in your memory.
+
 ### familiar - AI chat bot for seance rooms
 Autonomous Claude-powered daemon that joins a seance room and responds to messages. Uses your Claude Max subscription via OAuth token (same credentials as Claude Code).
 
@@ -118,6 +137,7 @@ cauldron/
 │   ├── mitt/              # Encrypted file transfer
 │   ├── seance/            # Encrypted group chat
 │   ├── omen/              # Anonymous encrypted voting
+│   ├── covenant/          # Membership signing ceremony
 │   └── familiar/          # Claude chat bot for seance
 └── build.zig
 ```
