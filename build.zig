@@ -133,9 +133,44 @@ pub fn build(b: *std.Build) void {
     });
     const run_familiar_tests = b.addRunArtifact(familiar_tests);
 
+    // Build omen app
+    const omen_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/omen/src/main.zig"),
+    });
+
+    const omen_exe = b.addExecutable(.{
+        .name = "omen",
+        .root_module = omen_module,
+    });
+    b.installArtifact(omen_exe);
+
+    // Run step for omen
+    const omen_run = b.addRunArtifact(omen_exe);
+    omen_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        omen_run.addArgs(args);
+    }
+    const omen_run_step = b.step("omen", "Run the omen app");
+    omen_run_step.dependOn(&omen_run.step);
+
+    // Unit tests for omen
+    const omen_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("apps/omen/src/main.zig"),
+    });
+
+    const omen_tests = b.addTest(.{
+        .root_module = omen_test_module,
+    });
+    const run_omen_tests = b.addRunArtifact(omen_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mitt_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_seance_tests.step);
     test_step.dependOn(&run_familiar_tests.step);
+    test_step.dependOn(&run_omen_tests.step);
 }

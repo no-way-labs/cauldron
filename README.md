@@ -32,6 +32,28 @@ seance join bore.pub:54321 --password fuzzy-planet-42 --familiar
 seance join bore.pub:54321 --password fuzzy-planet-42 --bot --api-port 9999
 ```
 
+### omen - anonymous encrypted voting
+One person hosts a vote with a question and options, others join to cast ballots. Votes are committed, then revealed — every participant independently verifies the tally. Nothing touches disk unless you pipe the artifact.
+
+```bash
+# Host a vote
+omen host "What should we name the release?" --options alpha,beta,gamma
+
+# Join a vote
+omen join bore.pub:54321 --password misty-raven-42
+
+# Simple yes/no (default options)
+omen host "Ship today?"
+
+# Save the cryptographic proof artifact
+omen host "Ship today?" > result.json
+
+# Verify a saved artifact
+omen verify result.json
+```
+
+**Security**: commit-reveal protocol with BLAKE2b commitments, Ed25519 signatures, and Fisher-Yates shuffled reveals. Every participant verifies all signatures, checks the bijection between reveals and commitments, and tallies independently. The host cannot forge, alter, add, or remove votes without detection.
+
 ### familiar - AI chat bot for seance rooms
 Autonomous Claude-powered daemon that joins a seance room and responds to messages. Uses your Claude Max subscription via OAuth token (same credentials as Claude Code).
 
@@ -95,6 +117,7 @@ cauldron/
 ├── apps/
 │   ├── mitt/              # Encrypted file transfer
 │   ├── seance/            # Encrypted group chat
+│   ├── omen/              # Anonymous encrypted voting
 │   └── familiar/          # Claude chat bot for seance
 └── build.zig
 ```
