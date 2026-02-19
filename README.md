@@ -50,6 +50,10 @@ omen host "Ship today?" > result.json
 
 # Verify a saved artifact
 omen verify result.json
+
+# Restrict voting to a covenant roster
+omen host "Ship today?" --roster team.json --identity "my secret phrase"
+omen join bore.pub:54321 --password misty-raven-42 --identity "my secret phrase"
 ```
 
 **Security**: commit-reveal protocol with BLAKE2b commitments, Ed25519 signatures, and Fisher-Yates shuffled reveals. Every participant verifies all signatures, checks the bijection between reveals and commitments, and tallies independently. The host cannot forge, alter, add, or remove votes without detection.
