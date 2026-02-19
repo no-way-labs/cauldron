@@ -2,7 +2,7 @@
 
 Autonomous Claude-powered chat bot daemon for [seance](../seance/) rooms.
 
-Polls a seance bot's HTTP API for new messages, sends them to Claude, and posts responses back to the room. Uses your Claude Max subscription via OAuth token (same as Claude Code).
+Polls a seance bot's HTTP API for new messages, sends them to Claude, and posts responses back to the room.
 
 ## Usage
 
@@ -38,12 +38,13 @@ familiar [options]
 
 ## Authentication
 
-familiar needs a Claude OAuth token. It checks these sources in order:
+familiar requires the `ANTHROPIC_API_KEY` environment variable:
 
-1. `CLAUDE_CODE_OAUTH_TOKEN` environment variable
-2. macOS Keychain (`security find-generic-password -s "Claude Code-credentials" -w`)
+```
+export ANTHROPIC_API_KEY=sk-ant-...
+```
 
-To set up a token, run `claude` (Claude Code CLI) and authenticate, then familiar will automatically pick up the stored credential.
+Get an API key from [console.anthropic.com](https://console.anthropic.com/).
 
 ## Building
 

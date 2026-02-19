@@ -1,7 +1,7 @@
 const std = @import("std");
 const core = @import("familiar_core");
 
-pub const version = "0.1.3";
+pub const version = "0.2.0";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -69,14 +69,16 @@ fn fatal(msg: []const u8) noreturn {
 
 fn printUsage() void {
     std.debug.print(
-        \\familiar {s} - Claude chat bot for seance rooms
+        \\familiar {s} - AI chat bot for seance rooms
         \\
         \\Usage: familiar [options]
+        \\
+        \\Requires ANTHROPIC_API_KEY environment variable.
         \\
         \\Options:
         \\  --api-port PORT  Seance bot API port (default: 9999)
         \\  --api-host HOST  Seance bot API host (default: 127.0.0.1)
-        \\  --system PROMPT  Additional system prompt / personality
+        \\  --system PROMPT  System prompt / personality
         \\  --context N      Messages to keep as context (default: 50)
         \\  --model MODEL    Claude model (default: claude-sonnet-4-5-20250929)
         \\  --cooldown SECS  Seconds between responses (default: 2)

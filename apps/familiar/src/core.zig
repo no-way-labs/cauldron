@@ -46,12 +46,12 @@ fn runInner(allocator: std.mem.Allocator, config: Config, running: ?*std.atomic.
     var token = getToken(allocator) catch |err| {
         logTs();
         std.debug.print("Failed to get token: {}\n", .{err});
-        std.debug.print("Set CLAUDE_CODE_OAUTH_TOKEN or run 'claude setup-token'\n", .{});
+        std.debug.print("Set ANTHROPIC_API_KEY env var\n", .{});
         return err;
     };
     defer allocator.free(token);
     logTs();
-    std.debug.print("Claude token acquired.\n", .{});
+    std.debug.print("API key loaded.\n", .{});
 
     // Initialize HTTP client (only used for Claude HTTPS API)
     var http_client = std.http.Client{ .allocator = allocator };
@@ -212,50 +212,10 @@ fn runInner(allocator: std.mem.Allocator, config: Config, running: ?*std.atomic.
 
 const api_endpoint = "https://api.anthropic.com/v1/messages";
 const anthropic_version = "2023-06-01";
-const anthropic_beta = "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
-const mandatory_system = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Retrieve OAuth token from env var or macOS keychain.
+/// Retrieve API key from ANTHROPIC_API_KEY env var.
 pub fn getToken(allocator: std.mem.Allocator) ![]u8 {
-    // Try env var first
-    if (std.process.getEnvVarOwned(allocator, "CLAUDE_CODE_OAUTH_TOKEN")) |token| {
-        return token;
-    } else |_| {}
-
-    // Try macOS keychain
-    return getTokenFromKeychain(allocator);
-}
-
-fn getTokenFromKeychain(allocator: std.mem.Allocator) ![]u8 {
-    var process = std.process.Child.init(
-        &.{ "security", "find-generic-password", "-s", "Claude Code-credentials", "-w" },
-        allocator,
-    );
-    process.stdout_behavior = .Pipe;
-    process.stderr_behavior = .Pipe;
-    try process.spawn();
-
-    const stdout = process.stdout.?;
-    var buf: [65536]u8 = undefined;
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = stdout.read(buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-    _ = try process.wait();
-
-    const raw = std.mem.trimRight(u8, buf[0..total], &std.ascii.whitespace);
-    if (raw.len == 0) return error.NoCredentials;
-
-    // Parse JSON to extract claudeAiOauth.accessToken
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-
-    const oauth_obj = parsed.value.object.get("claudeAiOauth") orelse return error.NoOauthField;
-    const token_val = oauth_obj.object.get("accessToken") orelse return error.NoAccessToken;
-
-    return try allocator.dupe(u8, token_val.string);
+    return std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch return error.NoCredentials;
 }
 
 /// Call Claude API with conversation history. Returns the response text.
@@ -292,20 +252,15 @@ fn chatOnce(
     const body = try buildRequestBody(allocator, model, system_prompt, messages);
     defer allocator.free(body);
 
-    // Build auth header value
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
-    defer allocator.free(auth_value);
-
     const uri = try std.Uri.parse(api_endpoint);
     var req = try http_client.request(.POST, uri, .{
         .headers = .{
             .content_type = .{ .override = "application/json" },
-            .authorization = .{ .override = auth_value },
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = &.{
             .{ .name = "anthropic-version", .value = anthropic_version },
-            .{ .name = "anthropic-beta", .value = anthropic_beta },
+            .{ .name = "x-api-key", .value = token },
         },
     });
     defer req.deinit();
@@ -368,25 +323,14 @@ fn buildRequestBody(
 
     try json.appendSlice(allocator, "{\"model\":\"");
     try appendJsonEscaped(&json, allocator, model);
+    const default_personality =
+        "You are familiar, a chat bot in a seance room. " ++
+        "You are friendly, concise, and conversational. Messages from others are formatted as 'nick: message'. " ++
+        "Respond naturally without prefixing your nick. Keep responses brief unless asked for detail.";
+
     try json.appendSlice(allocator, "\",\"max_tokens\":4096,\"system\":[{\"type\":\"text\",\"text\":\"");
-    try appendJsonEscaped(&json, allocator, mandatory_system);
-    try json.appendSlice(allocator, "\"}");
-
-    if (system_prompt) |sp| {
-        try json.appendSlice(allocator, ",{\"type\":\"text\",\"text\":\"");
-        try appendJsonEscaped(&json, allocator, sp);
-        try json.appendSlice(allocator, "\"}");
-    }
-
-    // Default personality if no custom system prompt
-    if (system_prompt == null) {
-        try json.appendSlice(allocator,
-            ",{\"type\":\"text\",\"text\":\"You are familiar, a chat bot in a seance room. " ++
-            "You are friendly, concise, and conversational. Messages from others are formatted as 'nick: message'. " ++
-            "Respond naturally without prefixing your nick. Keep responses brief unless asked for detail.\"}");
-    }
-
-    try json.appendSlice(allocator, "],\"messages\":[");
+    try appendJsonEscaped(&json, allocator, system_prompt orelse default_personality);
+    try json.appendSlice(allocator, "\"}],\"messages\":[");
 
     // Build messages array with strict role alternation
     var last_role: ?ChatRole = null;
