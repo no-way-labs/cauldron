@@ -3,15 +3,17 @@ const core = @import("familiar_core");
 
 pub const version = "0.2.0";
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     var config = core.Config{};
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_list: std.ArrayList([:0]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    var args_it = std.process.Args.Iterator.init(init.minimal.args);
+    while (args_it.next()) |arg| try args_list.append(allocator, arg);
+    const args = args_list.items;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -55,7 +57,7 @@ pub fn main() !void {
         }
     }
 
-    core.run(allocator, config, null);
+    core.run(allocator, io, config, init.environ_map, null);
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -86,4 +88,10 @@ fn printUsage() void {
         \\  -v, --version    Show version
         \\
     , .{version});
+}
+
+// 0.16 `zig test <root>` only runs the root file's own tests; pull in the core
+// module so any of its test blocks are discovered by the gate command.
+test {
+    _ = @import("familiar_core");
 }

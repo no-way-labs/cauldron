@@ -2,13 +2,13 @@ const std = @import("std");
 
 const wordlist_data = @embedFile("wordlist.txt");
 
-pub fn generate(allocator: std.mem.Allocator) ![]const u8 {
-    var prng = std.Random.DefaultPrng.init(blk: {
-        var seed: u64 = undefined;
-        try std.posix.getrandom(std.mem.asBytes(&seed));
-        break :blk seed;
-    });
-    const random = prng.random();
+pub fn generate(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    // Seed a CSPRNG from the Io entropy source rather than a fast,
+    // predictable PRNG — this password is a shared secret.
+    var seed: [std.Random.ChaCha.secret_seed_length]u8 = undefined;
+    io.random(&seed);
+    var csprng = std.Random.ChaCha.init(seed);
+    const random = csprng.random();
 
     var words = try std.ArrayList([]const u8).initCapacity(allocator, 0);
     defer words.deinit(allocator);
@@ -25,11 +25,15 @@ pub fn generate(allocator: std.mem.Allocator) ![]const u8 {
         return error.InsufficientWords;
     }
 
+    // Three words + a two-digit number (~35 bits with a 787-word list).
+    // The shared password is the only secret protecting traffic over the
+    // public relay, so favor entropy over brevity.
     const word1 = words.items[random.uintLessThan(usize, words.items.len)];
     const word2 = words.items[random.uintLessThan(usize, words.items.len)];
+    const word3 = words.items[random.uintLessThan(usize, words.items.len)];
     const number = random.uintLessThan(u16, 100);
 
-    return std.fmt.allocPrint(allocator, "{s}-{s}-{d}", .{ word1, word2, number });
+    return std.fmt.allocPrint(allocator, "{s}-{s}-{s}-{d}", .{ word1, word2, word3, number });
 }
 
 pub const ParsedId = struct {
@@ -61,7 +65,7 @@ pub fn parse(allocator: std.mem.Allocator, id: []const u8) !ParsedId {
 
 test "generate creates valid ID format" {
     const allocator = std.testing.allocator;
-    const id = try generate(allocator);
+    const id = try generate(allocator, std.testing.io);
     defer allocator.free(id);
 
     var count: usize = 0;
@@ -70,7 +74,7 @@ test "generate creates valid ID format" {
         count += 1;
     }
 
-    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(usize, 4), count);
 }
 
 test "parse extracts words and number" {

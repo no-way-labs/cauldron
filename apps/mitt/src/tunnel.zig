@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 const BoreResult = struct {
     process: std.process.Child,
@@ -13,11 +14,12 @@ pub const Tunnel = struct {
     local_port: u16,
     process: std.process.Child,
     allocator: std.mem.Allocator,
+    io: Io,
     running: std.atomic.Value(bool),
     monitor_thread: ?std.Thread,
 
-    pub fn establish(allocator: std.mem.Allocator, local_port: u16, bore_port: u16) !Tunnel {
-        const result = try spawnBore(allocator, local_port, bore_port);
+    pub fn establish(allocator: std.mem.Allocator, io: Io, local_port: u16, bore_port: u16) !Tunnel {
+        const result = try spawnBore(allocator, io, local_port, bore_port);
         return Tunnel{
             .public_host = result.public_host,
             .public_port = result.public_port,
@@ -25,6 +27,7 @@ pub const Tunnel = struct {
             .local_port = local_port,
             .process = result.process,
             .allocator = allocator,
+            .io = io,
             .running = std.atomic.Value(bool).init(true),
             .monitor_thread = null,
         };
@@ -41,14 +44,14 @@ pub const Tunnel = struct {
             // Drain stdout until EOF (bore process death)
             if (self.process.stdout) |stdout| {
                 while (self.running.load(.monotonic)) {
-                    const n = stdout.read(&drain_buf) catch break;
+                    const n = std.posix.read(stdout.handle, &drain_buf) catch break;
                     if (n == 0) break; // EOF - process died
                 }
             } else {
                 // No stdout pipe, fall back to polling
                 while (self.running.load(.monotonic)) {
-                    std.Thread.sleep(std.time.ns_per_s);
-                    _ = self.process.wait() catch break;
+                    self.io.sleep(.fromSeconds(1), .awake) catch break;
+                    _ = self.process.wait(self.io) catch break;
                 }
             }
 
@@ -65,13 +68,13 @@ pub const Tunnel = struct {
                 const delay_secs = @min(@as(u64, 1) << @intCast(attempt), 30);
                 var waited: u64 = 0;
                 while (waited < delay_secs and self.running.load(.monotonic)) : (waited += 1) {
-                    std.Thread.sleep(std.time.ns_per_s);
+                    self.io.sleep(.fromSeconds(1), .awake) catch break;
                 }
 
                 if (!self.running.load(.monotonic)) break;
 
                 // Try to reclaim the same port
-                if (spawnBore(self.allocator, self.local_port, self.public_port)) |result| {
+                if (spawnBore(self.allocator, self.io, self.local_port, self.public_port)) |result| {
                     self.process = result.process;
                     self.allocator.free(result.public_host);
                     if (result.public_port != self.public_port) {
@@ -96,7 +99,7 @@ pub const Tunnel = struct {
 
     pub fn shutdown(self: *Tunnel) void {
         self.running.store(false, .monotonic);
-        _ = self.process.kill() catch {};
+        self.process.kill(self.io);
         if (self.monitor_thread) |thread| {
             thread.join();
         }
@@ -104,7 +107,7 @@ pub const Tunnel = struct {
     }
 };
 
-fn spawnBore(allocator: std.mem.Allocator, local_port: u16, bore_port: u16) !BoreResult {
+fn spawnBore(allocator: std.mem.Allocator, io: Io, local_port: u16, bore_port: u16) !BoreResult {
     const port_str = try std.fmt.allocPrint(allocator, "{d}", .{local_port});
     defer allocator.free(port_str);
 
@@ -130,12 +133,11 @@ fn spawnBore(allocator: std.mem.Allocator, local_port: u16, bore_port: u16) !Bor
             "bore.pub",
         };
 
-    var process = std.process.Child.init(args, allocator);
-
-    process.stdout_behavior = .Pipe;
-    process.stderr_behavior = .Pipe;
-
-    try process.spawn();
+    var process = try std.process.spawn(io, .{
+        .argv = args,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
 
     var stdout_buffer: [4096]u8 = undefined;
     var stderr_buffer: [4096]u8 = undefined;
@@ -149,8 +151,8 @@ fn spawnBore(allocator: std.mem.Allocator, local_port: u16, bore_port: u16) !Bor
 
     while (timeout_counter < max_timeout) : (timeout_counter += 1) {
         // Read from stdout
-        const stdout_bytes = stdout.read(stdout_buffer[stdout_read..]) catch |err| {
-            _ = process.kill() catch {};
+        const stdout_bytes = std.posix.read(stdout.handle, stdout_buffer[stdout_read..]) catch |err| {
+            process.kill(io);
             return err;
         };
 
@@ -178,7 +180,7 @@ fn spawnBore(allocator: std.mem.Allocator, local_port: u16, bore_port: u16) !Bor
         }
 
         // Check stderr for errors
-        const stderr_bytes = stderr.read(stderr_buffer[stderr_read..]) catch 0;
+        const stderr_bytes = std.posix.read(stderr.handle, stderr_buffer[stderr_read..]) catch 0;
         if (stderr_bytes > 0) {
             stderr_read += stderr_bytes;
             const stderr_output = stderr_buffer[0..stderr_read];
@@ -187,14 +189,14 @@ fn spawnBore(allocator: std.mem.Allocator, local_port: u16, bore_port: u16) !Bor
             if (std.mem.indexOf(u8, stderr_output, "address already in use") != null or
                 std.mem.indexOf(u8, stderr_output, "port") != null and std.mem.indexOf(u8, stderr_output, "in use") != null)
             {
-                _ = process.kill() catch {};
+                process.kill(io);
                 return error.PortInUse;
             }
         }
 
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        io.sleep(.fromMilliseconds(100), .awake) catch break;
     }
 
-    _ = process.kill() catch {};
+    process.kill(io);
     return error.TunnelTimeout;
 }

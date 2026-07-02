@@ -21,87 +21,78 @@ pub const Frame = struct {
     ciphertext: []const u8,
 };
 
-pub fn writeFrame(stream: std.net.Stream, frame: Frame) !void {
+/// Write a frame to a buffered writer. Does NOT flush; the caller flushes after
+/// possibly batching so the whole frame lands in one syscall where possible.
+pub fn writeFrame(out: *std.Io.Writer, frame: Frame) !void {
     // Write msg_type
-    var type_buf: [1]u8 = .{@intFromEnum(frame.msg_type)};
-    try stream.writeAll(&type_buf);
+    try out.writeByte(@intFromEnum(frame.msg_type));
 
     // Write timestamp (u64 big-endian)
-    var timestamp_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &timestamp_buf, frame.timestamp, .big);
-    try stream.writeAll(&timestamp_buf);
+    try out.writeInt(u64, frame.timestamp, .big);
 
     // Write sender_len and sender (clamped to MAX_NICK_LEN)
     const sender_len: u8 = @min(@as(u8, @intCast(frame.sender.len)), MAX_NICK_LEN);
-    var sender_len_buf: [1]u8 = .{sender_len};
-    try stream.writeAll(&sender_len_buf);
-    try stream.writeAll(frame.sender[0..sender_len]);
+    try out.writeByte(sender_len);
+    try out.writeAll(frame.sender[0..sender_len]);
 
     // Write payload_len (u32 big-endian)
-    var payload_len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &payload_len_buf, @intCast(frame.ciphertext.len), .big);
-    try stream.writeAll(&payload_len_buf);
+    try out.writeInt(u32, @intCast(frame.ciphertext.len), .big);
 
     // Write nonce
-    try stream.writeAll(&frame.nonce);
+    try out.writeAll(&frame.nonce);
 
     // Write tag
-    try stream.writeAll(&frame.tag);
+    try out.writeAll(&frame.tag);
 
     // Write ciphertext
-    try stream.writeAll(frame.ciphertext);
+    try out.writeAll(frame.ciphertext);
 }
 
-pub fn readFrame(allocator: std.mem.Allocator, stream: std.net.Stream) !Frame {
+/// Convenience: write one frame to a stream with a transient buffered writer and
+/// flush it. Keeps the many one-shot send sites DRY; the read side still uses a
+/// single persistent reader per connection.
+pub fn sendFrame(io: std.Io, stream: std.Io.net.Stream, frame: Frame) !void {
+    var write_buf: [8192]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buf);
+    try writeFrame(&stream_writer.interface, frame);
+    try stream_writer.interface.flush();
+}
+
+/// Read a frame from a persistent, buffered stream reader. Reads error on EOF,
+/// so the manual short-read checks of the pre-0.16 socket API are gone.
+pub fn readFrame(allocator: std.mem.Allocator, in: *std.Io.Reader) !Frame {
     // Read msg_type
-    var type_buf: [1]u8 = undefined;
-    const n0 = try stream.readAtLeast(&type_buf, 1);
-    if (n0 < 1) return error.UnexpectedEOF;
-    const msg_type = std.meta.intToEnum(MessageType, type_buf[0]) catch {
-        return error.InvalidMessageType;
-    };
+    const type_byte = try in.takeByte();
+    const msg_type = std.enums.fromInt(MessageType, type_byte) orelse return error.InvalidMessageType;
 
     // Read timestamp (u64 big-endian)
-    var timestamp_buf: [8]u8 = undefined;
-    const n1 = try stream.readAtLeast(&timestamp_buf, 8);
-    if (n1 < 8) return error.UnexpectedEOF;
-    const timestamp = std.mem.readInt(u64, &timestamp_buf, .big);
+    const timestamp = try in.takeInt(u64, .big);
 
     // Read sender_len
-    var sender_len_buf: [1]u8 = undefined;
-    const n2 = try stream.readAtLeast(&sender_len_buf, 1);
-    if (n2 < 1) return error.UnexpectedEOF;
-    const sender_len = sender_len_buf[0];
+    const sender_len = try in.takeByte();
     if (sender_len > MAX_NICK_LEN) return error.SenderTooLong;
 
     // Read sender
     const sender = try allocator.alloc(u8, sender_len);
     errdefer allocator.free(sender);
-    const n3 = try stream.readAtLeast(sender, sender_len);
-    if (n3 < sender_len) return error.UnexpectedEOF;
+    try in.readSliceAll(sender);
 
     // Read payload_len (u32 big-endian)
-    var payload_len_buf: [4]u8 = undefined;
-    const n4 = try stream.readAtLeast(&payload_len_buf, 4);
-    if (n4 < 4) return error.UnexpectedEOF;
-    const payload_len = std.mem.readInt(u32, &payload_len_buf, .big);
+    const payload_len = try in.takeInt(u32, .big);
     if (payload_len > MAX_PAYLOAD_LEN) return error.PayloadTooLarge;
 
     // Read nonce
     var nonce: [24]u8 = undefined;
-    const n5 = try stream.readAtLeast(&nonce, 24);
-    if (n5 < 24) return error.UnexpectedEOF;
+    try in.readSliceAll(&nonce);
 
     // Read tag
     var tag: [16]u8 = undefined;
-    const n6 = try stream.readAtLeast(&tag, 16);
-    if (n6 < 16) return error.UnexpectedEOF;
+    try in.readSliceAll(&tag);
 
     // Read ciphertext
     const ciphertext = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(ciphertext);
-    const n7 = try stream.readAtLeast(ciphertext, payload_len);
-    if (n7 < payload_len) return error.UnexpectedEOF;
+    try in.readSliceAll(ciphertext);
 
     return Frame{
         .msg_type = msg_type,

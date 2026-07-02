@@ -11,7 +11,7 @@ pub const EncryptedData = struct {
     }
 };
 
-pub fn deriveKey(password: []const u8) [32]u8 {
+pub fn deriveKey(io: std.Io, password: []const u8) [32]u8 {
     var key: [32]u8 = undefined;
     const salt = "seance-v1-salt!!";
     var salt_bytes: [16]u8 = undefined;
@@ -24,22 +24,26 @@ pub fn deriveKey(password: []const u8) [32]u8 {
         &salt_bytes,
         .{ .t = 3, .m = 65536, .p = 4 },
         .argon2id,
+        io,
     ) catch |err| {
-        std.debug.print("Warning: Argon2 KDF failed: {}, using SHA-256 fallback\n", .{err});
-        std.crypto.hash.sha2.Sha256.hash(password, &key, .{});
+        // Fail closed. Argon2id only fails on allocation failure (it needs
+        // 64 MiB); never silently downgrade to a weak, unsalted hash that
+        // both peers would still accept as a valid key.
+        std.debug.print("Fatal: key derivation failed ({}). Free some memory and retry.\n", .{err});
+        std.process.exit(1);
     };
 
     return key;
 }
 
-pub fn generatePassword(allocator: std.mem.Allocator) ![]const u8 {
+pub fn generatePassword(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     const id_module = @import("id.zig");
-    return try id_module.generate(allocator);
+    return try id_module.generate(allocator, io);
 }
 
-pub fn encrypt(allocator: std.mem.Allocator, plaintext: []const u8, key: [32]u8) !EncryptedData {
+pub fn encrypt(allocator: std.mem.Allocator, io: std.Io, plaintext: []const u8, key: [32]u8) !EncryptedData {
     var nonce: [24]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    io.random(&nonce);
 
     const ciphertext = try allocator.alloc(u8, plaintext.len);
     errdefer allocator.free(ciphertext);
@@ -102,10 +106,10 @@ pub fn decryptRaw(allocator: std.mem.Allocator, nonce: [24]u8, tag: [16]u8, ciph
 test "encrypt and decrypt roundtrip" {
     const allocator = std.testing.allocator;
     const password = "test-password-123";
-    const key = deriveKey(password);
+    const key = deriveKey(std.testing.io, password);
     const plaintext = "Hello, World!";
 
-    var encrypted = try encrypt(allocator, plaintext, key);
+    var encrypted = try encrypt(allocator, std.testing.io, plaintext, key);
     defer encrypted.deinit();
 
     const decrypted = try decrypt(allocator, encrypted, key);

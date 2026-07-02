@@ -14,7 +14,7 @@ pub const EncryptedData = struct {
     }
 };
 
-pub fn deriveKey(password: []const u8) [32]u8 {
+pub fn deriveKey(io: std.Io, password: []const u8) [32]u8 {
     var key: [32]u8 = undefined;
 
     // Use Argon2id for secure password-based key derivation
@@ -36,28 +36,31 @@ pub fn deriveKey(password: []const u8) [32]u8 {
         password,
         &salt_bytes,
         .{
-            .t = 3,  // time cost (iterations)
-            .m = 65536,  // memory cost in KiB (64 MiB)
-            .p = 4,  // parallelism
+            .t = 3, // time cost (iterations)
+            .m = 65536, // memory cost in KiB (64 MiB)
+            .p = 4, // parallelism
         },
         .argon2id,
+        io,
     ) catch |err| {
-        // Fallback to deterministic key on error (should never happen)
-        std.debug.print("Warning: Argon2 KDF failed: {}, using SHA-256 fallback\n", .{err});
-        std.crypto.hash.sha2.Sha256.hash(password, &key, .{});
+        // Fail closed. Argon2id only fails on allocation failure (it needs
+        // 64 MiB); never silently downgrade to a weak, unsalted hash that
+        // both peers would still accept as a valid key.
+        std.debug.print("Fatal: key derivation failed ({}). Free some memory and retry.\n", .{err});
+        std.process.exit(1);
     };
 
     return key;
 }
 
-pub fn generatePassword(allocator: std.mem.Allocator) ![]const u8 {
+pub fn generatePassword(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     const id_module = @import("id.zig");
-    return try id_module.generate(allocator);
+    return try id_module.generate(allocator, io);
 }
 
-pub fn encrypt(allocator: std.mem.Allocator, plaintext: []const u8, key: [32]u8) !EncryptedData {
+pub fn encrypt(allocator: std.mem.Allocator, io: std.Io, plaintext: []const u8, key: [32]u8) !EncryptedData {
     var nonce: [24]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    io.random(&nonce);
 
     const ciphertext = try allocator.alloc(u8, plaintext.len);
     errdefer allocator.free(ciphertext);
@@ -103,11 +106,11 @@ test "encrypt and decrypt" {
     const allocator = std.testing.allocator;
 
     const password = "test-password-123";
-    const key = deriveKey(password);
+    const key = deriveKey(std.testing.io, password);
 
     const plaintext = "Hello, World!";
 
-    var encrypted = try encrypt(allocator, plaintext, key);
+    var encrypted = try encrypt(allocator, std.testing.io, plaintext, key);
     defer encrypted.deinit();
 
     const decrypted = try decrypt(allocator, encrypted, key);

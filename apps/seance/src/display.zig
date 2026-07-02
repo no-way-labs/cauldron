@@ -56,7 +56,26 @@ pub fn formatTime(buf: *[5]u8, timestamp: u64) []const u8 {
 // Tracks both content and cursor position so display functions can
 // save/restore partial input around incoming messages.
 
-var input_mutex: std.Thread.Mutex = .{};
+// std.Thread.Mutex was removed in Zig 0.16, and std.Io.Mutex needs an `io`
+// handle this module-level singleton has no owner for. The guarded sections are
+// tiny terminal writes contended by at most two threads (reader + stdin) at
+// human typing speed, so a spinlock is equivalent in practice and keeps every
+// call site unchanged.
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        while (self.locked.swap(true, .acquire)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
+var input_mutex: SpinLock = .{};
 var input_buf: [4096]u8 = undefined;
 var input_len: usize = 0;
 var input_cursor: usize = 0;
@@ -184,14 +203,16 @@ pub fn inputSubmit(out: []u8) []const u8 {
 }
 
 /// Read and handle an escape sequence (arrow keys, home, end, delete).
-/// Call after reading ESC (byte 27).
-pub fn handleEscapeSeq(stdin: std.fs.File) void {
+/// Call after reading ESC (byte 27). Takes the raw stdin fd: single-byte
+/// interactive reads want std.posix.read, not a buffered Io.Reader that would
+/// read ahead past the escape sequence.
+pub fn handleEscapeSeq(handle: std.posix.fd_t) void {
     var buf: [1]u8 = undefined;
-    const n = stdin.read(&buf) catch return;
+    const n = std.posix.read(handle, &buf) catch return;
     if (n == 0) return;
     if (buf[0] != '[') return;
 
-    const n2 = stdin.read(&buf) catch return;
+    const n2 = std.posix.read(handle, &buf) catch return;
     if (n2 == 0) return;
     switch (buf[0]) {
         'D' => inputLeft(),
@@ -200,7 +221,7 @@ pub fn handleEscapeSeq(stdin: std.fs.File) void {
         'F' => inputEnd(),
         '3' => {
             // Delete key: ESC[3~
-            const n3 = stdin.read(&buf) catch return;
+            const n3 = std.posix.read(handle, &buf) catch return;
             if (n3 > 0 and buf[0] == '~') inputDelete();
         },
         else => {},

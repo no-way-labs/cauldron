@@ -4,13 +4,15 @@ const client = @import("client.zig");
 const tunnel = @import("tunnel.zig");
 const crypto = @import("crypto.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_list: std.ArrayList([:0]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    var args_it = std.process.Args.Iterator.init(init.minimal.args);
+    while (args_it.next()) |arg| try args_list.append(allocator, arg);
+    const args = args_list.items;
 
     if (args.len < 2) {
         try printUsage();
@@ -20,9 +22,9 @@ pub fn main() !void {
     const command = args[1];
 
     if (std.mem.eql(u8, command, "open")) {
-        try handleOpen(allocator, args[2..]);
+        try handleOpen(allocator, io, init.environ_map, args[2..]);
     } else if (std.mem.eql(u8, command, "send")) {
-        try handleSend(allocator, args[2..]);
+        try handleSend(allocator, io, init.environ_map, args[2..]);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         try printUsage();
@@ -58,7 +60,7 @@ fn printUsage() !void {
     , .{});
 }
 
-fn handleOpen(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleOpen(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, args: []const [:0]const u8) !void {
     var port: u16 = 0;
     var bore_port: u16 = 0;
     var dir: []const u8 = "./inbox";
@@ -115,33 +117,15 @@ fn handleOpen(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    // Generate or use password
-    const password = if (password_opt) |p|
-        try allocator.dupe(u8, p)
-    else
-        try crypto.generatePassword(allocator);
-    defer if (password_opt == null) allocator.free(password);
+    // Password: --password flag, else MITT_PASSWORD env, else auto-generate.
+    const password = (try resolveSecret(allocator, environ, password_opt, "MITT_PASSWORD")) orelse
+        try crypto.generatePassword(allocator, io);
+    defer allocator.free(password);
 
-    const key = crypto.deriveKey(password);
+    const key = crypto.deriveKey(io, password);
 
-    // Get port if not specified
-    if (port == 0) {
-        const address = try std.net.Address.parseIp4("127.0.0.1", 0);
-        const socket = try std.posix.socket(address.any.family, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
-        defer std.posix.close(socket);
-
-        try std.posix.bind(socket, &address.any, address.getOsSockLen());
-        try std.posix.listen(socket, 1);
-
-        var sock_addr: std.posix.sockaddr.storage = undefined;
-        var sock_len: std.posix.socklen_t = @sizeOf(@TypeOf(sock_addr));
-        try std.posix.getsockname(socket, @ptrCast(&sock_addr), &sock_len);
-
-        const addr = std.net.Address.initPosix(@alignCast(@ptrCast(&sock_addr)));
-        port = addr.getPort();
-    }
-
-    var srv = try server.Server.init(allocator, port, .{
+    // Port 0 lets the kernel pick; Server.init reports the bound port.
+    var srv = try server.Server.init(allocator, io, port, .{
         .dir = dir,
         .to_stdout = to_stdout,
         .accept = accept,
@@ -149,6 +133,7 @@ fn handleOpen(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .max_size = max_size,
     }, key);
     defer srv.shutdown();
+    port = srv.port;
 
     if (!quiet) {
         std.debug.print("\n🔐 Password: {s}\n", .{password});
@@ -159,7 +144,7 @@ fn handleOpen(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer if (tun_opt) |*tun| tun.shutdown();
 
     if (!local_only) {
-        if (tunnel.Tunnel.establish(allocator, port, bore_port)) |tun| {
+        if (tunnel.Tunnel.establish(allocator, io, port, bore_port)) |tun| {
             tun_opt = tun;
             tun_opt.?.startMonitor();
             std.debug.print("Public: {s}:{d}", .{ tun.public_host, tun.public_port });
@@ -178,7 +163,7 @@ fn handleOpen(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             // If a specific port was requested but is in use, retry with random port
             if (err == error.PortInUse and bore_port > 0) {
                 std.debug.print("Bore port {d} is already in use, trying random port...\n", .{bore_port});
-                if (tunnel.Tunnel.establish(allocator, port, 0)) |tun| {
+                if (tunnel.Tunnel.establish(allocator, io, port, 0)) |tun| {
                     tun_opt = tun;
                     tun_opt.?.startMonitor();
                     std.debug.print("Public: {s}:{d}\n", .{ tun.public_host, tun.public_port });
@@ -215,7 +200,7 @@ fn handleOpen(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     try srv.run();
 }
 
-fn handleSend(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleSend(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("Usage: mitt send <host:port> [<payload>] --password <pass> [--text <text>]\n", .{});
         std.process.exit(1);
@@ -247,13 +232,13 @@ fn handleSend(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    if (password_opt == null) {
-        std.debug.print("Error: --password is required\n", .{});
+    // Password: --password flag, else MITT_PASSWORD env, else error.
+    const password = (try resolveSecret(allocator, environ, password_opt, "MITT_PASSWORD")) orelse {
+        std.debug.print("Error: --password (or MITT_PASSWORD) is required\n", .{});
         std.process.exit(1);
-    }
-
-    const password = password_opt.?;
-    const key = crypto.deriveKey(password);
+    };
+    defer allocator.free(password);
+    const key = crypto.deriveKey(io, password);
 
     // Parse target (host:port)
     const colon_pos = std.mem.indexOf(u8, target, ":") orelse {
@@ -282,7 +267,7 @@ fn handleSend(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         std.process.exit(1);
     };
 
-    const result = try client.send(allocator, host, port, payload, key, timeout_seconds * 1000);
+    const result = try client.send(allocator, io, host, port, payload, key, timeout_seconds * 1000);
 
     switch (result) {
         .delivered => {
@@ -301,6 +286,18 @@ fn handleSend(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 }
 
+/// Resolve a secret from an explicit flag, else an environment variable, so it
+/// need not appear in argv (visible in `ps`) or shell history. An exported-but-
+/// empty variable is treated as unset — deriving a key from "" would produce a
+/// deterministic, publicly reproducible secret. Returns owned memory the caller
+/// frees, or null if neither source provided a non-empty value.
+fn resolveSecret(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, flag: ?[]const u8, env_name: []const u8) !?[]u8 {
+    if (flag) |f| return try allocator.dupe(u8, f);
+    const value = environ.get(env_name) orelse return null;
+    if (value.len == 0) return null; // exported-but-empty == unset
+    return try allocator.dupe(u8, value);
+}
+
 fn parseGlobs(allocator: std.mem.Allocator, input: []const u8) ![]const []const u8 {
     var list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
     errdefer list.deinit(allocator);
@@ -313,6 +310,12 @@ fn parseGlobs(allocator: std.mem.Allocator, input: []const u8) ![]const []const 
     return try list.toOwnedSlice(allocator);
 }
 
-test "simple test" {
-    try std.testing.expect(true);
+// 0.16's `zig test <root>` only runs the root file's own tests; reference the
+// sibling modules so their tests are discovered too.
+test {
+    _ = @import("crypto.zig");
+    _ = @import("id.zig");
+    _ = @import("storage.zig");
+    _ = @import("filter.zig");
+    _ = @import("server.zig");
 }

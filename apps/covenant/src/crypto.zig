@@ -11,7 +11,7 @@ pub const EncryptedData = struct {
     }
 };
 
-pub fn deriveKey(password: []const u8) [32]u8 {
+pub fn deriveKey(io: std.Io, password: []const u8) [32]u8 {
     var key: [32]u8 = undefined;
     const salt = "covenant-v1-salt";
     var salt_bytes: [16]u8 = undefined;
@@ -24,22 +24,26 @@ pub fn deriveKey(password: []const u8) [32]u8 {
         &salt_bytes,
         .{ .t = 3, .m = 65536, .p = 4 },
         .argon2id,
+        io,
     ) catch |err| {
-        std.debug.print("Warning: Argon2 KDF failed: {}, using SHA-256 fallback\n", .{err});
-        std.crypto.hash.sha2.Sha256.hash(password, &key, .{});
+        // Fail closed. Argon2id only fails on allocation failure (it needs
+        // 64 MiB); never silently downgrade to a weak, unsalted hash that
+        // both peers would still accept as a valid key.
+        std.debug.print("Fatal: key derivation failed ({}). Free some memory and retry.\n", .{err});
+        std.process.exit(1);
     };
 
     return key;
 }
 
-pub fn generatePassword(allocator: std.mem.Allocator) ![]const u8 {
+pub fn generatePassword(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     const id_module = @import("id.zig");
-    return try id_module.generate(allocator);
+    return try id_module.generate(allocator, io);
 }
 
-pub fn encrypt(allocator: std.mem.Allocator, plaintext: []const u8, key: [32]u8) !EncryptedData {
+pub fn encrypt(allocator: std.mem.Allocator, io: std.Io, plaintext: []const u8, key: [32]u8) !EncryptedData {
     var nonce: [24]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    io.random(&nonce);
 
     const ciphertext = try allocator.alloc(u8, plaintext.len);
     errdefer allocator.free(ciphertext);
@@ -108,21 +112,35 @@ pub const KeyPair = Ed25519.KeyPair;
 
 /// Derive a deterministic Ed25519 keypair from a passphrase.
 /// Same passphrase always yields the same keypair.
-pub fn deriveIdentity(passphrase: []const u8) KeyPair {
+pub fn deriveIdentity(io: std.Io, passphrase: []const u8) KeyPair {
+    // Stretch the passphrase with Argon2id before seeding Ed25519, so a weak
+    // identity phrase can't be brute-forced offline into someone's signing
+    // key. The salt is a fixed domain string (the identity must be
+    // deterministic across machines, so it cannot be random). Bumped to v2
+    // with this change — identities derived by older builds will not match.
     var seed: [32]u8 = undefined;
-    var hasher = Blake2b256.init(.{});
-    hasher.update("covenant-id-v1");
-    hasher.update(passphrase);
-    hasher.final(&seed);
+    const salt = "covenant-id-v2!!"; // exactly 16 bytes
+    std.crypto.pwhash.argon2.kdf(
+        std.heap.page_allocator,
+        &seed,
+        passphrase,
+        salt,
+        .{ .t = 3, .m = 65536, .p = 4 },
+        .argon2id,
+        io,
+    ) catch |err| {
+        std.debug.print("Fatal: identity derivation failed ({}). Free some memory and retry.\n", .{err});
+        std.process.exit(1);
+    };
     return Ed25519.KeyPair.generateDeterministic(seed) catch {
-        // Identity element is astronomically unlikely from BLAKE2b output
+        // Identity element is astronomically unlikely from the KDF output
         @panic("identity element hit in key derivation");
     };
 }
 
 /// Generate an ephemeral Ed25519 keypair for this session.
-pub fn generateKeyPair() KeyPair {
-    return Ed25519.KeyPair.generate();
+pub fn generateKeyPair(io: std.Io) KeyPair {
+    return Ed25519.KeyPair.generate(io);
 }
 
 /// Get public key bytes from a KeyPair
@@ -132,7 +150,10 @@ pub fn publicKeyBytes(key_pair: KeyPair) [32]u8 {
 
 /// Sign data with Ed25519.
 pub fn sign(message: []const u8, key_pair: KeyPair) [64]u8 {
-    const sig = key_pair.sign(message, null) catch return [_]u8{0} ** 64;
+    // Signing our own message with a valid key does not fail in practice; if
+    // it ever did, fail loudly rather than emit a silent all-zero signature
+    // that would later just read as "unsigned".
+    const sig = key_pair.sign(message, null) catch @panic("Ed25519 signing failed");
     return sig.toBytes();
 }
 
@@ -169,11 +190,12 @@ pub fn verifyRosterSig(roster_hash: [32]u8, sig: [64]u8, public_key: [32]u8) boo
 
 test "encrypt and decrypt roundtrip" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     const password = "test-password-123";
-    const key = deriveKey(password);
+    const key = deriveKey(io, password);
     const plaintext = "Hello, World!";
 
-    var encrypted_data = try encrypt(allocator, plaintext, key);
+    var encrypted_data = try encrypt(allocator, io, plaintext, key);
     defer encrypted_data.deinit();
 
     const decrypted = try decrypt(allocator, encrypted_data, key);
@@ -183,17 +205,18 @@ test "encrypt and decrypt roundtrip" {
 }
 
 test "deriveIdentity is deterministic" {
-    const kp1 = deriveIdentity("my secret phrase");
-    const kp2 = deriveIdentity("my secret phrase");
+    const io = std.testing.io;
+    const kp1 = deriveIdentity(io, "my secret phrase");
+    const kp2 = deriveIdentity(io, "my secret phrase");
     try std.testing.expectEqual(publicKeyBytes(kp1), publicKeyBytes(kp2));
 
     // Different passphrase gives different key
-    const kp3 = deriveIdentity("different phrase");
+    const kp3 = deriveIdentity(io, "different phrase");
     try std.testing.expect(!std.mem.eql(u8, &publicKeyBytes(kp1), &publicKeyBytes(kp3)));
 }
 
 test "Ed25519 sign and verify" {
-    const kp = deriveIdentity("test");
+    const kp = deriveIdentity(std.testing.io, "test");
     const msg = "test message";
     const sig = sign(msg, kp);
     try std.testing.expect(verify(sig, msg, publicKeyBytes(kp)));

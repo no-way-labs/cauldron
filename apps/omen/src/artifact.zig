@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const crypto = @import("crypto.zig");
 const protocol = @import("protocol.zig");
 
@@ -18,6 +19,7 @@ fn hexEncode(bytes: []const u8, buf: []u8) []const u8 {
 /// Returns owned JSON string.
 pub fn buildArtifact(
     allocator: std.mem.Allocator,
+    io: Io,
     session_id: [32]u8,
     question: []const u8,
     options: []const []const u8,
@@ -44,7 +46,7 @@ pub fn buildArtifact(
     try json.appendSlice(allocator, "\",");
 
     // timestamp
-    const ts = @as(u64, @intCast(std.time.timestamp()));
+    const ts = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds()));
     try appendFmt(allocator, &json, "\"timestamp\":{d},", .{ts});
 
     // question
@@ -70,6 +72,21 @@ pub fn buildArtifact(
     try json.appendSlice(allocator, "\"roster_hash\":\"");
     try json.appendSlice(allocator, hexEncode(&roster_hash, &rh_hex));
     try json.appendSlice(allocator, "\",");
+
+    // roster (slot, nick, pubkey) — lets a standalone verifier recompute the
+    // roster hash and check every commitment signature against the right key.
+    // Order matches how the host built the roster, which the hash depends on.
+    try json.appendSlice(allocator, "\"roster\":[");
+    for (roster, 0..) |peer, i| {
+        if (i > 0) try json.append(allocator, ',');
+        var pk_hex_r: [64]u8 = undefined;
+        try appendFmt(allocator, &json, "{{\"slot\":{d},\"nick\":\"", .{peer.slot_id});
+        try appendJsonEscaped(allocator, &json, peer.nick);
+        try json.appendSlice(allocator, "\",\"pubkey\":\"");
+        try json.appendSlice(allocator, hexEncode(&peer.pubkey, &pk_hex_r));
+        try json.appendSlice(allocator, "\"}");
+    }
+    try json.appendSlice(allocator, "],");
 
     // commitments
     try json.appendSlice(allocator, "\"commitments\":[");

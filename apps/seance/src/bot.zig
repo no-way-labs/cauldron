@@ -1,19 +1,23 @@
 const std = @import("std");
+const Io = std.Io;
 const client_mod = @import("client.zig");
 
 pub const ApiServer = struct {
     client: *client_mod.Client,
-    listener: std.net.Server,
+    io: Io,
+    listener: Io.net.Server,
     running: std.atomic.Value(bool),
 
     pub fn init(client: *client_mod.Client, port: u16) !ApiServer {
-        const address = try std.net.Address.parseIp("127.0.0.1", port);
-        const listener = try address.listen(.{
+        const io = client.io;
+        const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+        const listener = try address.listen(io, .{
             .reuse_address = true,
         });
 
         return ApiServer{
             .client = client,
+            .io = io,
             .listener = listener,
             .running = std.atomic.Value(bool).init(true),
         };
@@ -21,19 +25,19 @@ pub const ApiServer = struct {
 
     pub fn run(self: *ApiServer) void {
         while (self.running.load(.monotonic)) {
-            const conn = self.listener.accept() catch |err| {
+            const stream = self.listener.accept(self.io) catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 std.debug.print("API accept error: {}\n", .{err});
                 continue;
             };
 
-            self.handleConnection(conn.stream);
+            self.handleConnection(stream);
         }
     }
 
     pub fn stop(self: *ApiServer) void {
         self.running.store(false, .monotonic);
-        self.listener.deinit();
+        self.listener.deinit(self.io);
     }
 
     pub fn deinit(self: *ApiServer) void {
@@ -42,43 +46,46 @@ pub const ApiServer = struct {
         }
     }
 
-    fn handleConnection(self: *ApiServer, stream: std.net.Stream) void {
-        defer stream.close();
+    fn handleConnection(self: *ApiServer, stream: Io.net.Stream) void {
+        const io = self.io;
+        defer stream.close(io);
 
-        var buffer: [8192]u8 = undefined;
-        var total: usize = 0;
+        // One persistent reader accumulates the request in its buffer; we never
+        // consume from it, so `buffered()` grows with each `fillMore`.
+        var read_buf: [8192]u8 = undefined;
+        var stream_reader = stream.reader(io, &read_buf);
+        const in = &stream_reader.interface;
 
-        // Read until we have the full request (headers + body)
-        while (total < buffer.len) {
-            const bytes_read = stream.read(buffer[total..]) catch return;
-            if (bytes_read == 0) break;
-            total += bytes_read;
-
-            // Check if we have headers yet
-            if (std.mem.indexOf(u8, buffer[0..total], "\r\n\r\n")) |headers_end| {
+        // Read until we have the full request (headers + body).
+        while (true) {
+            const data = in.buffered();
+            if (std.mem.indexOf(u8, data, "\r\n\r\n")) |headers_end| {
                 // Parse Content-Length to know how much body to expect
                 var content_length: usize = 0;
-                if (std.mem.indexOf(u8, buffer[0..headers_end], "Content-Length: ")) |cl_pos| {
+                if (std.mem.indexOf(u8, data[0..headers_end], "Content-Length: ")) |cl_pos| {
                     const cl_start = cl_pos + "Content-Length: ".len;
-                    const cl_end = std.mem.indexOfScalarPos(u8, buffer[0..headers_end], cl_start, '\r') orelse headers_end;
-                    content_length = std.fmt.parseInt(usize, buffer[cl_start..cl_end], 10) catch 0;
+                    const cl_end = std.mem.indexOfScalarPos(u8, data[0..headers_end], cl_start, '\r') orelse headers_end;
+                    content_length = std.fmt.parseInt(usize, data[cl_start..cl_end], 10) catch 0;
                 }
                 const body_start = headers_end + 4;
-                if (total >= body_start + content_length) break;
+                if (data.len >= body_start + content_length) break;
             }
+            if (in.buffered().len >= read_buf.len) break; // request too large for buffer
+            in.fillMore() catch break; // EOF or read error
         }
 
-        if (total == 0) return;
+        const buffered = in.buffered();
+        if (buffered.len == 0) return;
 
-        const request = parseRequest(buffer[0..total]) orelse {
-            writeResponse(stream, 400, "Bad Request", "text/plain", "Invalid HTTP request");
+        const request = parseRequest(buffered) orelse {
+            writeResponse(io, stream, 400, "Bad Request", "text/plain", "Invalid HTTP request");
             return;
         };
 
         self.routeRequest(stream, request);
     }
 
-    fn routeRequest(self: *ApiServer, stream: std.net.Stream, request: HttpRequest) void {
+    fn routeRequest(self: *ApiServer, stream: Io.net.Stream, request: HttpRequest) void {
         if (request.method == .POST and std.mem.eql(u8, request.path, "/send")) {
             self.handleSend(stream, request.body);
         } else if (request.method == .GET and std.mem.eql(u8, request.path, "/messages")) {
@@ -90,33 +97,33 @@ pub const ApiServer = struct {
         } else if (request.method == .GET and std.mem.eql(u8, request.path, "/nick")) {
             self.handleNick(stream);
         } else if (request.method == .GET and std.mem.eql(u8, request.path, "/health")) {
-            writeResponse(stream, 200, "OK", "application/json", "{\"status\":\"ok\"}");
+            writeResponse(self.io, stream, 200, "OK", "application/json", "{\"status\":\"ok\"}");
         } else {
-            writeResponse(stream, 404, "Not Found", "text/plain", "Not found");
+            writeResponse(self.io, stream, 404, "Not Found", "text/plain", "Not found");
         }
     }
 
-    fn handleSend(self: *ApiServer, stream: std.net.Stream, body: []const u8) void {
+    fn handleSend(self: *ApiServer, stream: Io.net.Stream, body: []const u8) void {
         if (body.len == 0) {
-            writeResponse(stream, 400, "Bad Request", "text/plain", "Empty message");
+            writeResponse(self.io, stream, 400, "Bad Request", "text/plain", "Empty message");
             return;
         }
 
-        const trimmed = std.mem.trimRight(u8, body, "\n\r");
+        const trimmed = std.mem.trimEnd(u8, body, "\n\r");
         if (trimmed.len == 0) {
-            writeResponse(stream, 400, "Bad Request", "text/plain", "Empty message");
+            writeResponse(self.io, stream, 400, "Bad Request", "text/plain", "Empty message");
             return;
         }
 
         self.client.sendMessage(trimmed) catch {
-            writeResponse(stream, 500, "Internal Server Error", "text/plain", "Failed to send");
+            writeResponse(self.io, stream, 500, "Internal Server Error", "text/plain", "Failed to send");
             return;
         };
 
-        writeResponse(stream, 200, "OK", "application/json", "{\"status\":\"sent\"}");
+        writeResponse(self.io, stream, 200, "OK", "application/json", "{\"status\":\"sent\"}");
     }
 
-    fn handleMessages(self: *ApiServer, stream: std.net.Stream, query: []const u8) void {
+    fn handleMessages(self: *ApiServer, stream: Io.net.Stream, query: []const u8) void {
         var since_id: u64 = 0;
         var wait_secs: u64 = 0;
         if (query.len > 0) {
@@ -133,50 +140,50 @@ pub const ApiServer = struct {
         }
 
         const buf = self.client.msg_buffer orelse {
-            writeResponse(stream, 500, "Internal Server Error", "text/plain", "No message buffer");
+            writeResponse(self.io, stream, 500, "Internal Server Error", "text/plain", "No message buffer");
             return;
         };
 
         // Long poll: wait up to wait_secs for new messages
         if (wait_secs > 0) {
-            const deadline = @as(u64, @intCast(std.time.timestamp())) + wait_secs;
-            while (@as(u64, @intCast(std.time.timestamp())) < deadline and self.running.load(.monotonic)) {
+            const deadline = @as(u64, @intCast(Io.Clock.real.now(self.io).toSeconds())) + wait_secs;
+            while (@as(u64, @intCast(Io.Clock.real.now(self.io).toSeconds())) < deadline and self.running.load(.monotonic)) {
                 if (buf.hasMessagesSince(since_id)) break;
-                std.Thread.sleep(200 * std.time.ns_per_ms);
+                self.io.sleep(.fromMilliseconds(200), .awake) catch {};
             }
         }
 
         const json = buf.getSince(since_id, self.client.allocator) catch {
-            writeResponse(stream, 500, "Internal Server Error", "text/plain", "Failed to get messages");
+            writeResponse(self.io, stream, 500, "Internal Server Error", "text/plain", "Failed to get messages");
             return;
         };
         defer self.client.allocator.free(json);
 
-        writeResponse(stream, 200, "OK", "application/json", json);
+        writeResponse(self.io, stream, 200, "OK", "application/json", json);
     }
 
-    fn handlePeers(self: *ApiServer, stream: std.net.Stream) void {
+    fn handlePeers(self: *ApiServer, stream: Io.net.Stream) void {
         const json = self.client.getPeers(self.client.allocator) catch {
-            writeResponse(stream, 500, "Internal Server Error", "text/plain", "Failed to get peers");
+            writeResponse(self.io, stream, 500, "Internal Server Error", "text/plain", "Failed to get peers");
             return;
         };
         defer self.client.allocator.free(json);
 
-        writeResponse(stream, 200, "OK", "application/json", json);
+        writeResponse(self.io, stream, 200, "OK", "application/json", json);
     }
 
-    fn handleQuit(self: *ApiServer, stream: std.net.Stream) void {
-        writeResponse(stream, 200, "OK", "application/json", "{\"status\":\"disconnecting\"}");
+    fn handleQuit(self: *ApiServer, stream: Io.net.Stream) void {
+        writeResponse(self.io, stream, 200, "OK", "application/json", "{\"status\":\"disconnecting\"}");
         self.client.running.store(false, .monotonic);
     }
 
-    fn handleNick(self: *ApiServer, stream: std.net.Stream) void {
+    fn handleNick(self: *ApiServer, stream: Io.net.Stream) void {
         var buf: [256]u8 = undefined;
         const json = std.fmt.bufPrint(&buf, "{{\"nick\":\"{s}\"}}", .{self.client.nick}) catch {
-            writeResponse(stream, 500, "Internal Server Error", "text/plain", "Failed to format nick");
+            writeResponse(self.io, stream, 500, "Internal Server Error", "text/plain", "Failed to format nick");
             return;
         };
-        writeResponse(stream, 200, "OK", "application/json", json);
+        writeResponse(self.io, stream, 200, "OK", "application/json", json);
     }
 };
 
@@ -238,16 +245,19 @@ fn parseRequest(buffer: []const u8) ?HttpRequest {
     };
 }
 
-fn writeResponse(stream: std.net.Stream, status: u16, status_text: []const u8, content_type: []const u8, body: []const u8) void {
+fn writeResponse(io: Io, stream: Io.net.Stream, status: u16, status_text: []const u8, content_type: []const u8, body: []const u8) void {
     var header_buf: [512]u8 = undefined;
     const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, status_text, content_type, body.len }) catch return;
 
-    stream.writeAll(header) catch return;
+    var write_buf: [4096]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buf);
+    const out = &stream_writer.interface;
+    out.writeAll(header) catch return;
     if (body.len > 0) {
-        stream.writeAll(body) catch return;
+        out.writeAll(body) catch return;
     }
+    out.flush() catch return;
 
-    // Shutdown write side to send FIN immediately
-    const sock: std.posix.socket_t = stream.handle;
-    std.posix.shutdown(sock, .send) catch {};
+    // Shutdown write side to send FIN immediately (posix.shutdown is gone in 0.16).
+    stream.shutdown(io, .send) catch {};
 }

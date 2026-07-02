@@ -51,23 +51,27 @@ pub fn verifyCovenant(
         }
         const obj = json[obj_start..pos];
 
-        const nick = extractField(obj, "nick") orelse continue;
-        const pubkey_hex = extractField(obj, "pubkey") orelse continue;
-        const sig_hex = extractField(obj, "signature") orelse continue;
+        // A malformed member object is tampering/corruption, not something to
+        // silently skip: record it as invalid so verification fails loudly.
+        const nick = extractField(obj, "nick") orelse "<malformed>";
+        const pubkey_hex = extractField(obj, "pubkey") orelse "";
+        const sig_hex = extractField(obj, "signature") orelse "";
 
-        if (pubkey_hex.len != 64 or sig_hex.len != 128) continue;
+        var pubkey: [32]u8 = [_]u8{0} ** 32;
+        var valid = false;
 
-        const pk_bytes = artifact.hexDecode(allocator, pubkey_hex) catch continue;
-        defer allocator.free(pk_bytes);
-        const sig_bytes = artifact.hexDecode(allocator, sig_hex) catch continue;
-        defer allocator.free(sig_bytes);
-
-        var pubkey: [32]u8 = undefined;
-        @memcpy(&pubkey, pk_bytes[0..32]);
-        var sig: [64]u8 = undefined;
-        @memcpy(&sig, sig_bytes[0..64]);
-
-        const valid = crypto.verifyRosterSig(roster_hash, sig, pubkey);
+        if (pubkey_hex.len == 64 and sig_hex.len == 128) {
+            if (artifact.hexDecode(allocator, pubkey_hex)) |pk_bytes| {
+                defer allocator.free(pk_bytes);
+                if (artifact.hexDecode(allocator, sig_hex)) |sig_bytes| {
+                    defer allocator.free(sig_bytes);
+                    @memcpy(&pubkey, pk_bytes[0..32]);
+                    var sig: [64]u8 = undefined;
+                    @memcpy(&sig, sig_bytes[0..64]);
+                    valid = crypto.verifyRosterSig(roster_hash, sig, pubkey);
+                } else |_| {}
+            } else |_| {}
+        }
 
         members.append(allocator, .{
             .nick = try allocator.dupe(u8, nick),
@@ -141,4 +145,48 @@ fn extractField(json: []const u8, field: []const u8) ?[]const u8 {
     }
     if (end >= json.len) return null;
     return json[start..end];
+}
+
+// --- Fuzz test for the untrusted covenant JSON parser ---
+//
+// 0.16 `std.testing.fuzz` passes a `*std.testing.Smith`; a plain `zig test`
+// replays the corpus (fed as `Smith.in`) plus one empty input, and
+// `zig build test --fuzz` drives it with real fuzzer input. `smith.slice`
+// reads a little-endian u32 length prefix first, so `seed` prepends one.
+
+/// Wrap raw parser bytes as a `Smith.slice` seed (LE u32 length prefix + bytes).
+fn seed(comptime payload: []const u8) []const u8 {
+    const out = comptime blk: {
+        var buf: [4 + payload.len]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], @intCast(payload.len), .little);
+        @memcpy(buf[4..], payload);
+        break :blk buf;
+    };
+    return &out;
+}
+
+fn fuzzVerifyCovenant(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+    var result = verifyCovenant(std.testing.allocator, buf[0..n]) catch return;
+    freeVerifyResult(std.testing.allocator, &result);
+}
+
+test "fuzz verifyCovenant" {
+    const hex64 = "0" ** 64;
+    const hex128 = "0" ** 128;
+    try std.testing.fuzz({}, fuzzVerifyCovenant, .{
+        .corpus = &.{
+            // Well-formed structure (signature won't verify, so valid=false, but
+            // parsing succeeds and returns an owned result to free).
+            seed("{\"group_name\":\"g\",\"roster_hash\":\"" ++ hex64 ++
+                "\",\"members\":[{\"nick\":\"a\",\"pubkey\":\"" ++ hex64 ++
+                "\",\"signature\":\"" ++ hex128 ++ "\"}],\"member_count\":1}"),
+            // Malformed roster_hash hex (right length, bad digit) -> parse error.
+            seed("{\"roster_hash\":\"" ++ ("0" ** 63) ++ "z\",\"members\":[{\"nick\":\"a\",\"pubkey\":\"" ++
+                hex64 ++ "\",\"signature\":\"" ++ hex128 ++ "\"}]}"),
+            // Empty members array -> NoMembers error.
+            seed("{\"roster_hash\":\"" ++ hex64 ++ "\",\"members\":[]}"),
+        },
+    });
 }

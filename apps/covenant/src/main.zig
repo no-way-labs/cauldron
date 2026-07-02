@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const server_mod = @import("server.zig");
 const client_mod = @import("client.zig");
 const tunnel = @import("tunnel.zig");
@@ -10,13 +11,15 @@ const artifact_mod = @import("artifact.zig");
 
 pub const version = "0.1.0";
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_list: std.ArrayList([:0]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    var args_it = std.process.Args.Iterator.init(init.minimal.args);
+    while (args_it.next()) |arg| try args_list.append(allocator, arg);
+    const args = args_list.items;
 
     if (args.len < 2) {
         printUsage();
@@ -32,13 +35,13 @@ pub fn main() !void {
         printUsage();
         return;
     } else if (std.mem.eql(u8, command, "host")) {
-        try handleHost(allocator, args[2..]);
+        try handleHost(allocator, io, init.environ_map, args[2..]);
     } else if (std.mem.eql(u8, command, "join")) {
-        try handleJoin(allocator, args[2..]);
+        try handleJoin(allocator, io, init.environ_map, args[2..]);
     } else if (std.mem.eql(u8, command, "verify")) {
-        try handleVerify(allocator, args[2..]);
+        try handleVerify(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "members")) {
-        try handleMembers(allocator, args[2..]);
+        try handleMembers(allocator, io, args[2..]);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();
@@ -76,7 +79,7 @@ fn printUsage() void {
     , .{});
 }
 
-fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleHost(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const [:0]const u8) !void {
     var port: u16 = 0;
     var bore_port: u16 = 0;
     var local_only = false;
@@ -119,6 +122,11 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 std.debug.print("Error: max-members must be a valid number\n", .{});
                 std.process.exit(1);
             };
+            if (max_members == 0 or max_members > 254) {
+                std.debug.print("Error: max-members must be between 1 and 254 " ++
+                    "(the host occupies one roster slot)\n", .{});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, arg, "--output") and i + 1 < args.len) {
             i += 1;
             output_path = args[i];
@@ -133,31 +141,32 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         std.process.exit(1);
     };
 
-    const identity_phrase = identity_opt orelse {
-        std.debug.print("Error: --identity is required\n", .{});
+    // Identity: --identity flag, else COVENANT_IDENTITY env var, else error.
+    const identity_owned = try resolveSecret(allocator, environ, identity_opt, "COVENANT_IDENTITY");
+    defer if (identity_owned) |e| allocator.free(e);
+    const identity_phrase = identity_owned orelse {
+        std.debug.print("Error: --identity or COVENANT_IDENTITY is required\n", .{});
         std.debug.print("Usage: covenant host \"Group Name\" --identity \"my passphrase\"\n", .{});
         std.process.exit(1);
     };
 
-    const identity = crypto.deriveIdentity(identity_phrase);
+    const identity = crypto.deriveIdentity(io, identity_phrase);
 
-    // Generate or use password
-    const password = if (password_opt) |p|
-        try allocator.dupe(u8, p)
-    else
-        try crypto.generatePassword(allocator);
+    // Password: --password flag, else COVENANT_PASSWORD env var, else auto-generate.
+    const password = (try resolveSecret(allocator, environ, password_opt, "COVENANT_PASSWORD")) orelse
+        try crypto.generatePassword(allocator, io);
     defer allocator.free(password);
 
-    const key = crypto.deriveKey(password);
+    const key = crypto.deriveKey(io, password);
 
     // Generate or use nick
     const nick = if (nick_opt) |n|
         try allocator.dupe(u8, n)
     else
-        try id.generate(allocator);
+        try id.generate(allocator, io);
     defer allocator.free(nick);
 
-    var srv = try server_mod.Server.init(allocator, .{
+    var srv = try server_mod.Server.init(allocator, io, .{
         .port = port,
         .max_members = max_members,
         .local_only = local_only,
@@ -165,7 +174,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }, key, nick, group_name, identity);
     defer srv.shutdown();
 
-    const actual_port = srv.listener.listen_address.getPort();
+    const actual_port = srv.port;
 
     // Print room info
     display.printBanner(version);
@@ -183,7 +192,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer if (tun_opt) |*tun| tun.shutdown();
 
     if (!local_only) {
-        if (tunnel.Tunnel.establish(allocator, actual_port, bore_port)) |tun| {
+        if (tunnel.Tunnel.establish(allocator, io, actual_port, bore_port)) |tun| {
             tun_opt = tun;
             tun_opt.?.startMonitor();
             std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}", .{ tun.public_host, tun.public_port });
@@ -199,7 +208,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else |err| {
             if (err == error.PortInUse and bore_port > 0) {
                 std.debug.print("Bore port {d} in use, trying random...\n", .{bore_port});
-                if (tunnel.Tunnel.establish(allocator, actual_port, 0)) |tun| {
+                if (tunnel.Tunnel.establish(allocator, io, actual_port, 0)) |tun| {
                     tun_opt = tun;
                     tun_opt.?.startMonitor();
                     std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}\n", .{ tun.public_host, tun.public_port });
@@ -231,7 +240,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     std.process.exit(0);
 }
 
-fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleJoin(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("Usage: covenant join <host:port> --password <pass> --identity \"<passphrase>\"\n", .{});
         std.process.exit(1);
@@ -268,19 +277,23 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    if (password_opt == null) {
-        std.debug.print("Error: --password is required\n", .{});
+    // Password: --password flag, else COVENANT_PASSWORD env var, else error.
+    const password = (try resolveSecret(allocator, environ, password_opt, "COVENANT_PASSWORD")) orelse {
+        std.debug.print("Error: --password or COVENANT_PASSWORD is required\n", .{});
         std.process.exit(1);
-    }
+    };
+    defer allocator.free(password);
 
-    const identity_phrase = identity_opt orelse {
-        std.debug.print("Error: --identity is required\n", .{});
+    // Identity: --identity flag, else COVENANT_IDENTITY env var, else error.
+    const identity_owned = try resolveSecret(allocator, environ, identity_opt, "COVENANT_IDENTITY");
+    defer if (identity_owned) |e| allocator.free(e);
+    const identity_phrase = identity_owned orelse {
+        std.debug.print("Error: --identity or COVENANT_IDENTITY is required\n", .{});
         std.process.exit(1);
     };
 
-    const password = password_opt.?;
-    const key = crypto.deriveKey(password);
-    const identity = crypto.deriveIdentity(identity_phrase);
+    const key = crypto.deriveKey(io, password);
+    const identity = crypto.deriveIdentity(io, identity_phrase);
 
     // Parse target host:port
     const colon_pos = std.mem.lastIndexOfScalar(u8, target, ':') orelse {
@@ -297,7 +310,7 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const nick = if (nick_opt) |n|
         try allocator.dupe(u8, n)
     else
-        try id.generate(allocator);
+        try id.generate(allocator, io);
     defer allocator.free(nick);
 
     display.printBanner(version);
@@ -306,7 +319,7 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     std.debug.print("\x1b[38;5;245mIdentity:\x1b[0m {x:0>2}{x:0>2}{x:0>2}{x:0>2}...\n", .{ pk[0], pk[1], pk[2], pk[3] });
     std.debug.print("\x1b[38;5;245mNick:\x1b[0m {s}\n", .{nick});
 
-    var client = client_mod.Client.connect(allocator, host, port, key, identity, .{
+    var client = client_mod.Client.connect(allocator, io, host, port, key, identity, .{
         .nick = nick,
         .timeout_secs = timeout_secs,
         .output_path = join_output_path,
@@ -321,20 +334,26 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     std.debug.print("\nCeremony complete.\n", .{});
 }
 
-fn handleVerify(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+/// Resolve a secret from an explicit flag, else an environment variable, so it
+/// need not appear in argv (visible in `ps`) or shell history. An exported-but-
+/// empty variable is treated as unset — deriving a key from "" would produce a
+/// deterministic, publicly reproducible secret. Returns owned memory the caller
+/// frees, or null if neither source provided a non-empty value.
+fn resolveSecret(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, flag: ?[]const u8, env_name: []const u8) !?[]u8 {
+    if (flag) |f| return try allocator.dupe(u8, f);
+    const value = environ.get(env_name) orelse return null;
+    if (value.len == 0) return null; // exported-but-empty == unset
+    return try allocator.dupe(u8, value);
+}
+
+fn handleVerify(allocator: std.mem.Allocator, io: Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("Usage: covenant verify <artifact.json>\n", .{});
         std.process.exit(1);
     }
 
     const file_path = args[0];
-    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
-        std.debug.print("Error: cannot open {s}: {}\n", .{ file_path, err });
-        std.process.exit(1);
-    };
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+    const content = Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(1024 * 1024)) catch |err| {
         std.debug.print("Error: cannot read {s}: {}\n", .{ file_path, err });
         std.process.exit(1);
     };
@@ -370,20 +389,14 @@ fn handleVerify(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
     }
 }
 
-fn handleMembers(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleMembers(allocator: std.mem.Allocator, io: Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("Usage: covenant members <artifact.json>\n", .{});
         std.process.exit(1);
     }
 
     const file_path = args[0];
-    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
-        std.debug.print("Error: cannot open {s}: {}\n", .{ file_path, err });
-        std.process.exit(1);
-    };
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+    const content = Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(1024 * 1024)) catch |err| {
         std.debug.print("Error: cannot read {s}: {}\n", .{ file_path, err });
         std.process.exit(1);
     };
@@ -413,3 +426,15 @@ fn handleMembers(allocator: std.mem.Allocator, args: []const [:0]const u8) !void
     }
     std.debug.print("\n", .{});
 }
+
+test {
+    // Pull in the unit tests from the sibling modules so `zig test main.zig`
+    // exercises them all.
+    _ = crypto;
+    _ = id;
+    _ = protocol;
+    _ = artifact_mod;
+    _ = verify_mod;
+}
+
+const protocol = @import("protocol.zig");

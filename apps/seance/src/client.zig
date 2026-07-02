@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const display = @import("display.zig");
@@ -15,22 +16,24 @@ pub const BufferedMessage = struct {
 
 pub const MessageBuffer = struct {
     messages: std.ArrayListUnmanaged(BufferedMessage),
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     next_id: u64,
     allocator: std.mem.Allocator,
+    io: Io,
 
-    pub fn init(allocator: std.mem.Allocator) MessageBuffer {
+    pub fn init(allocator: std.mem.Allocator, io: Io) MessageBuffer {
         return .{
-            .messages = .{},
-            .mutex = .{},
+            .messages = .empty,
+            .mutex = .init,
             .next_id = 1,
             .allocator = allocator,
+            .io = io,
         };
     }
 
     pub fn append(self: *MessageBuffer, timestamp: u64, sender: []const u8, content: []const u8, msg_type: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const owned_sender = self.allocator.dupe(u8, sender) catch return;
         const owned_content = self.allocator.dupe(u8, content) catch {
@@ -59,14 +62,14 @@ pub const MessageBuffer = struct {
     }
 
     pub fn hasMessagesSince(self: *MessageBuffer, since_id: u64) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.next_id > since_id + 1;
     }
 
     pub fn getSince(self: *MessageBuffer, since_id: u64, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var json = try std.ArrayList(u8).initCapacity(allocator, 0);
         errdefer json.deinit(allocator);
@@ -139,54 +142,59 @@ pub const ClientConfig = struct {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    io: Io,
+    stream: Io.net.Stream,
     key: [32]u8,
     nick: []const u8,
     running: std.atomic.Value(bool),
     msg_buffer: ?*MessageBuffer,
     peers: std.ArrayListUnmanaged([]const u8),
-    peers_mutex: std.Thread.Mutex,
-    stream_mutex: std.Thread.Mutex,
+    peers_mutex: std.Io.Mutex,
+    stream_mutex: std.Io.Mutex,
 
-    pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16, key: [32]u8, config: ClientConfig) !Client {
-        const stream = try std.net.tcpConnectToHost(allocator, host, port);
-        errdefer stream.close();
+    pub fn connect(allocator: std.mem.Allocator, io: Io, host: []const u8, port: u16, key: [32]u8, config: ClientConfig) !Client {
+        // Do NOT pass a connect timeout: Io.Threaded in Zig 0.16.0 panics on
+        // netConnectIpPosix with a timeout. The handshake socket timeouts below
+        // bound the actual JOIN exchange.
+        const stream = try connectToHost(io, host, port, .none);
+        errdefer stream.close(io);
 
         // Set socket timeouts for handshake
         const timeout = std.posix.timeval{ .sec = @intCast(config.timeout_secs), .usec = 0 };
-        try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
-        try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
 
         // Send JOIN frame
-        var encrypted = try crypto.encrypt(allocator, protocol.MAGIC, key);
+        var encrypted = try crypto.encrypt(allocator, io, protocol.MAGIC, key);
         defer encrypted.deinit();
 
         const join_frame = protocol.Frame{
             .msg_type = .join,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = config.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
 
-        try protocol.writeFrame(stream, join_frame);
+        try protocol.sendFrame(io, stream, join_frame);
 
         // Clear socket timeout after handshake
         const no_timeout = std.posix.timeval{ .sec = 0, .usec = 0 };
-        try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_timeout));
-        try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&no_timeout));
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_timeout));
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&no_timeout));
 
         return Client{
             .allocator = allocator,
+            .io = io,
             .stream = stream,
             .key = key,
             .nick = config.nick,
             .running = std.atomic.Value(bool).init(true),
             .msg_buffer = null,
-            .peers = .{},
-            .peers_mutex = .{},
-            .stream_mutex = .{},
+            .peers = .empty,
+            .peers_mutex = .init,
+            .stream_mutex = .init,
         };
     }
 
@@ -200,8 +208,8 @@ pub const Client = struct {
         self.running.store(false, .monotonic);
     }
 
-    pub fn runBot(self: *Client, api_port: u16, run_familiar: bool) !void {
-        var buffer = MessageBuffer.init(self.allocator);
+    pub fn runBot(self: *Client, api_port: u16, run_familiar: bool, environ: *const std.process.Environ.Map) !void {
+        var buffer = MessageBuffer.init(self.allocator, self.io);
         self.msg_buffer = &buffer;
         defer {
             buffer.deinit();
@@ -229,7 +237,9 @@ pub const Client = struct {
             };
             familiar_thread = std.Thread.spawn(.{}, familiar_core.run, .{
                 self.allocator,
+                self.io,
                 familiar_config,
+                environ,
                 &self.running,
             }) catch |err| blk: {
                 std.debug.print("Failed to start familiar: {}\n", .{err});
@@ -242,7 +252,7 @@ pub const Client = struct {
 
         // Block until shutdown
         while (self.running.load(.monotonic)) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            self.io.sleep(.fromMilliseconds(100), .awake) catch {};
         }
 
         self.sendLeave() catch {};
@@ -250,28 +260,28 @@ pub const Client = struct {
     }
 
     pub fn sendMessage(self: *Client, text: []const u8) !void {
-        var encrypted = try crypto.encrypt(self.allocator, text, self.key);
+        var encrypted = try crypto.encrypt(self.allocator, self.io, text, self.key);
         defer encrypted.deinit();
 
         const msg_frame = protocol.Frame{
             .msg_type = .msg,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(self.io).toSeconds())),
             .sender = self.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
 
-        self.stream_mutex.lock();
-        defer self.stream_mutex.unlock();
-        try protocol.writeFrame(self.stream, msg_frame);
+        self.stream_mutex.lockUncancelable(self.io);
+        defer self.stream_mutex.unlock(self.io);
+        try protocol.sendFrame(self.io, self.stream, msg_frame);
 
         display.printMessage(msg_frame.timestamp, self.nick, text);
     }
 
     pub fn getPeers(self: *Client, allocator: std.mem.Allocator) ![]u8 {
-        self.peers_mutex.lock();
-        defer self.peers_mutex.unlock();
+        self.peers_mutex.lockUncancelable(self.io);
+        defer self.peers_mutex.unlock(self.io);
 
         var json = try std.ArrayList(u8).initCapacity(allocator, 0);
         errdefer json.deinit(allocator);
@@ -289,8 +299,14 @@ pub const Client = struct {
     }
 
     fn readerLoop(self: *Client) void {
+        // One persistent reader for the connection: the interface buffers ahead,
+        // so a fresh reader per frame would drop already-received bytes.
+        var read_buf: [8192]u8 = undefined;
+        var stream_reader = self.stream.reader(self.io, &read_buf);
+        const in = &stream_reader.interface;
+
         while (self.running.load(.monotonic)) {
-            var frame = protocol.readFrame(self.allocator, self.stream) catch break;
+            var frame = protocol.readFrame(self.allocator, in) catch break;
             defer protocol.freeFrame(self.allocator, &frame);
 
             switch (frame.msg_type) {
@@ -333,7 +349,7 @@ pub const Client = struct {
                         self.allocator.free(plaintext);
                     }
 
-                    var nicks = std.ArrayListUnmanaged([]const u8){};
+                    var nicks: std.ArrayListUnmanaged([]const u8) = .empty;
                     defer nicks.deinit(self.allocator);
 
                     var iter = std.mem.tokenizeScalar(u8, plaintext, '\n');
@@ -352,23 +368,24 @@ pub const Client = struct {
     }
 
     fn stdinLoop(self: *Client) void {
-        const stdin = std.fs.File.stdin();
+        const stdin = Io.File.stdin();
+        const handle = stdin.handle;
 
         // Enable raw mode so we own the input buffer
         var original_termios: std.posix.termios = undefined;
-        const raw_mode = if (std.posix.isatty(stdin.handle)) blk: {
-            original_termios = std.posix.tcgetattr(stdin.handle) catch break :blk false;
+        const raw_mode = if (stdin.isTty(self.io) catch false) blk: {
+            original_termios = std.posix.tcgetattr(handle) catch break :blk false;
             var raw = original_termios;
             raw.lflag.ECHO = false;
             raw.lflag.ICANON = false;
             raw.lflag.ISIG = false;
             raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
             raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-            std.posix.tcsetattr(stdin.handle, .FLUSH, raw) catch break :blk false;
+            std.posix.tcsetattr(handle, .FLUSH, raw) catch break :blk false;
             break :blk true;
         } else false;
         defer if (raw_mode) {
-            std.posix.tcsetattr(stdin.handle, .FLUSH, original_termios) catch {};
+            std.posix.tcsetattr(handle, .FLUSH, original_termios) catch {};
         };
 
         if (raw_mode) {
@@ -376,7 +393,7 @@ pub const Client = struct {
             var submit_buf: [4096]u8 = undefined;
             while (self.running.load(.monotonic)) {
                 var byte_buf: [1]u8 = undefined;
-                const n = stdin.read(&byte_buf) catch break;
+                const n = std.posix.read(handle, &byte_buf) catch break;
                 if (n == 0) break;
                 const byte = byte_buf[0];
 
@@ -386,7 +403,7 @@ pub const Client = struct {
                         const line = display.inputSubmit(&submit_buf);
                         if (line.len == 0) continue;
                         if (std.mem.eql(u8, line, "/quit")) break;
-                        display.printMessage(@as(u64, @intCast(std.time.timestamp())), self.nick, line);
+                        display.printMessage(@as(u64, @intCast(Io.Clock.real.now(self.io).toSeconds())), self.nick, line);
                         self.sendMessage(line) catch {
                             display.printStatus("Connection lost.");
                             break;
@@ -396,7 +413,7 @@ pub const Client = struct {
                     21 => display.inputClear(), // Ctrl+U
                     1 => display.inputHome(), // Ctrl+A
                     5 => display.inputEnd(), // Ctrl+E
-                    27 => display.handleEscapeSeq(stdin), // ESC
+                    27 => display.handleEscapeSeq(handle), // ESC
                     else => {
                         if (byte >= 32) display.inputChar(byte);
                     },
@@ -405,9 +422,9 @@ pub const Client = struct {
         } else {
             var buffer: [4096]u8 = undefined;
             while (self.running.load(.monotonic)) {
-                const bytes_read = stdin.read(&buffer) catch break;
+                const bytes_read = std.posix.read(handle, &buffer) catch break;
                 if (bytes_read == 0) break;
-                const line = std.mem.trimRight(u8, buffer[0..bytes_read], "\n\r");
+                const line = std.mem.trimEnd(u8, buffer[0..bytes_read], "\n\r");
                 if (line.len == 0) continue;
                 if (std.mem.eql(u8, line, "/quit")) break;
                 self.sendMessage(line) catch {
@@ -419,26 +436,26 @@ pub const Client = struct {
     }
 
     fn sendLeave(self: *Client) !void {
-        var encrypted = try crypto.encrypt(self.allocator, "goodbye", self.key);
+        var encrypted = try crypto.encrypt(self.allocator, self.io, "goodbye", self.key);
         defer encrypted.deinit();
 
         const leave_frame = protocol.Frame{
             .msg_type = .leave,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(self.io).toSeconds())),
             .sender = self.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
 
-        self.stream_mutex.lock();
-        defer self.stream_mutex.unlock();
-        try protocol.writeFrame(self.stream, leave_frame);
+        self.stream_mutex.lockUncancelable(self.io);
+        defer self.stream_mutex.unlock(self.io);
+        try protocol.sendFrame(self.io, self.stream, leave_frame);
     }
 
     fn setPeers(self: *Client, nicks: []const []const u8) void {
-        self.peers_mutex.lock();
-        defer self.peers_mutex.unlock();
+        self.peers_mutex.lockUncancelable(self.io);
+        defer self.peers_mutex.unlock(self.io);
 
         for (self.peers.items) |p| {
             self.allocator.free(p);
@@ -457,8 +474,8 @@ pub const Client = struct {
     fn updatePeersFromAnnouncement(self: *Client, text: []const u8) void {
         if (std.mem.endsWith(u8, text, " joined")) {
             const nick = text[0 .. text.len - " joined".len];
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
+            self.peers_mutex.lockUncancelable(self.io);
+            defer self.peers_mutex.unlock(self.io);
             // Check for duplicate (nick_list may have already added this peer)
             for (self.peers.items) |peer| {
                 if (std.mem.eql(u8, peer, nick)) return;
@@ -469,8 +486,8 @@ pub const Client = struct {
             };
         } else if (std.mem.endsWith(u8, text, " left")) {
             const nick = text[0 .. text.len - " left".len];
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
+            self.peers_mutex.lockUncancelable(self.io);
+            defer self.peers_mutex.unlock(self.io);
             for (self.peers.items, 0..) |peer, i| {
                 if (std.mem.eql(u8, peer, nick)) {
                     self.allocator.free(peer);
@@ -483,14 +500,23 @@ pub const Client = struct {
 
     pub fn disconnect(self: *Client) void {
         self.running.store(false, .monotonic);
-        self.stream.close();
+        self.stream.close(self.io);
         std.crypto.secureZero(u8, &self.key);
 
-        self.peers_mutex.lock();
+        self.peers_mutex.lockUncancelable(self.io);
         for (self.peers.items) |p| {
             self.allocator.free(p);
         }
         self.peers.deinit(self.allocator);
-        self.peers_mutex.unlock();
+        self.peers_mutex.unlock(self.io);
     }
 };
+
+fn connectToHost(io: Io, host: []const u8, port: u16, timeout: Io.Timeout) !Io.net.Stream {
+    if (Io.net.IpAddress.parse(host, port)) |addr| {
+        return addr.connect(io, .{ .mode = .stream, .timeout = timeout });
+    } else |_| {
+        const host_name = try Io.net.HostName.init(host);
+        return host_name.connect(io, port, .{ .mode = .stream, .timeout = timeout });
+    }
+}

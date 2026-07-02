@@ -1,12 +1,47 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const Io = std.Io;
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const display = @import("display.zig");
 const verify_mod = @import("verify.zig");
 const artifact = @import("artifact.zig");
 
+/// getsockname is absent from std.posix in 0.16.0 (getpeername survived);
+/// wrap the OS-specific call until it returns.
+fn getsockname(handle: std.posix.socket_t, addr: *std.posix.sockaddr, len: *std.posix.socklen_t) !void {
+    switch (builtin.os.tag) {
+        .linux => {
+            const rc = std.os.linux.getsockname(handle, addr, len);
+            if (std.posix.errno(rc) != .SUCCESS) return error.GetSockNameFailed;
+        },
+        else => {
+            if (std.c.getsockname(handle, addr, len) != 0) return error.GetSockNameFailed;
+        },
+    }
+}
+
+/// Reads the locally bound port, for servers listening on port 0.
+fn boundPort(handle: std.posix.socket_t) ?u16 {
+    var addr: std.posix.sockaddr.storage = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    getsockname(handle, @ptrCast(&addr), &len) catch return null;
+    const sa: *const std.posix.sockaddr = @ptrCast(@alignCast(&addr));
+    return switch (sa.family) {
+        std.posix.AF.INET => blk: {
+            const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sa));
+            break :blk std.mem.bigToNative(u16, in.port);
+        },
+        std.posix.AF.INET6 => blk: {
+            const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(sa));
+            break :blk std.mem.bigToNative(u16, in6.port);
+        },
+        else => null,
+    };
+}
+
 const Voter = struct {
-    stream: std.net.Stream,
+    stream: Io.net.Stream,
     nick: []const u8,
     slot_id: u8,
     pubkey: [32]u8,
@@ -27,7 +62,9 @@ pub const ServerConfig = struct {
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    listener: std.net.Server,
+    io: Io,
+    port: u16,
+    listener: Io.net.Server,
     config: ServerConfig,
     key: [32]u8,
     host_nick: []const u8,
@@ -36,7 +73,7 @@ pub const Server = struct {
     session_id: [32]u8,
     host_keypair: crypto.KeyPair,
     voters: std.ArrayList(Voter),
-    voters_mutex: std.Thread.Mutex,
+    voters_mutex: Io.Mutex,
     phase: std.atomic.Value(u8),
     running: std.atomic.Value(bool),
     // Host's own vote data
@@ -48,6 +85,7 @@ pub const Server = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: Io,
         config: ServerConfig,
         key: [32]u8,
         host_nick: []const u8,
@@ -55,16 +93,23 @@ pub const Server = struct {
         options: []const []const u8,
         keypair: crypto.KeyPair,
     ) !Server {
-        const address = try std.net.Address.parseIp("0.0.0.0", config.port);
-        const listener = try address.listen(.{
+        const address = Io.net.IpAddress.parse("127.0.0.1", config.port) catch unreachable;
+        var listener = try address.listen(io, .{
             .reuse_address = true,
         });
+        errdefer listener.deinit(io);
+
+        // When asked for port 0 the kernel picks one; report the real port.
+        const actual_port = if (config.port != 0) config.port else boundPort(listener.socket.handle) orelse
+            return error.PortDiscoveryFailed;
 
         var session_id: [32]u8 = undefined;
-        std.crypto.random.bytes(&session_id);
+        io.random(&session_id);
 
         return Server{
             .allocator = allocator,
+            .io = io,
+            .port = actual_port,
             .listener = listener,
             .config = config,
             .key = key,
@@ -74,7 +119,7 @@ pub const Server = struct {
             .session_id = session_id,
             .host_keypair = keypair,
             .voters = try std.ArrayList(Voter).initCapacity(allocator, 0),
-            .voters_mutex = std.Thread.Mutex{},
+            .voters_mutex = .init,
             .phase = std.atomic.Value(u8).init(@intFromEnum(protocol.Phase.lobby)),
             .running = std.atomic.Value(bool).init(true),
             .host_commitment = null,
@@ -98,15 +143,15 @@ pub const Server = struct {
             const current_phase: protocol.Phase = @enumFromInt(self.phase.load(.monotonic));
             if (current_phase != .lobby) break;
 
-            const connection = self.listener.accept() catch |err| {
+            const stream = self.listener.accept(self.io) catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
 
-            const conn_thread = std.Thread.spawn(.{}, Server.handleConnection, .{ self, connection }) catch |err| {
+            const conn_thread = std.Thread.spawn(.{}, Server.handleConnection, .{ self, stream }) catch |err| {
                 std.debug.print("Failed to spawn connection thread: {}\n", .{err});
-                connection.stream.close();
+                stream.close(self.io);
                 continue;
             };
             conn_thread.detach();
@@ -116,16 +161,28 @@ pub const Server = struct {
         while (self.running.load(.monotonic)) {
             const current_phase: protocol.Phase = @enumFromInt(self.phase.load(.monotonic));
             if (current_phase == .done) break;
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            self.io.sleep(.fromMilliseconds(100), .awake) catch {};
         }
     }
 
-    fn handleConnection(self: *Server, connection: std.net.Server.Connection) void {
-        var stream = connection.stream;
+    fn handleConnection(self: *Server, stream: Io.net.Stream) void {
+        const io = self.io;
+
+        // Slow-loris guard: bound the handshake read so a connection that never
+        // sends a valid JOIN can't pin this thread indefinitely. Cleared once the
+        // voter is admitted (see below) so idle lobby voters aren't dropped.
+        const handshake_tv = std.posix.timeval{ .sec = 30, .usec = 0 };
+        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&handshake_tv)) catch {};
+
+        // ONE persistent reader for the whole connection: the interface buffers
+        // ahead, so every readFrame on this connection must share it.
+        var read_buf: [8192]u8 = undefined;
+        var stream_reader = stream.reader(io, &read_buf);
+        const in = &stream_reader.interface;
 
         // Read JOIN frame
-        const join_frame = protocol.readFrame(self.allocator, stream) catch {
-            stream.close();
+        const join_frame = protocol.readFrame(self.allocator, in) catch {
+            stream.close(io);
             return;
         };
         defer {
@@ -134,7 +191,7 @@ pub const Server = struct {
         }
 
         if (join_frame.msg_type != .join) {
-            stream.close();
+            stream.close(io);
             return;
         }
 
@@ -146,31 +203,40 @@ pub const Server = struct {
             join_frame.ciphertext,
             self.key,
         ) catch {
-            stream.close();
+            stream.close(io);
             return;
         };
         defer self.allocator.free(plaintext);
 
         if (plaintext.len != protocol.MAGIC.len or !std.crypto.timing_safe.eql([protocol.MAGIC.len]u8, plaintext[0..protocol.MAGIC.len].*, protocol.MAGIC[0..protocol.MAGIC.len].*)) {
-            stream.close();
+            stream.close(io);
             return;
         }
 
         // Only accept during lobby
         const current_phase: protocol.Phase = @enumFromInt(self.phase.load(.monotonic));
         if (current_phase != .lobby) {
-            stream.close();
+            stream.close(io);
             return;
         }
 
         // Resolve nick collision
         const nick = self.resolveNickCollision(join_frame.sender) catch {
-            stream.close();
+            stream.close(io);
             return;
         };
 
-        // Assign slot
-        self.voters_mutex.lock();
+        // Assign slot. The cap check shares the lock with the append so it is
+        // atomic: this both enforces max_voters and keeps slot_id (u8) from
+        // overflowing (len < max_voters <= 255, so slot_id = len + 1 <= 255).
+        self.voters_mutex.lockUncancelable(io);
+        if (self.voters.items.len >= self.config.max_voters) {
+            self.voters_mutex.unlock(io);
+            self.allocator.free(nick);
+            display.printStatus("Voter limit reached, rejecting connection.");
+            stream.close(io);
+            return;
+        }
         const slot_id: u8 = @intCast(self.voters.items.len + 1); // host is slot 0
         self.voters.append(self.allocator, .{
             .stream = stream,
@@ -182,29 +248,35 @@ pub const Server = struct {
             .signature = null,
             .reveal = null,
         }) catch {
-            self.voters_mutex.unlock();
+            self.voters_mutex.unlock(io);
             self.allocator.free(nick);
-            stream.close();
+            stream.close(io);
             return;
         };
         const voter_count = self.voters.items.len + 1; // +1 for host
-        self.voters_mutex.unlock();
+        self.voters_mutex.unlock(io);
+
+        // Handshake complete: clear the recv timeout so an admitted voter isn't
+        // dropped while idling in the lobby waiting for the host to /start.
+        const clear_tv = std.posix.timeval{ .sec = 0, .usec = 0 };
+        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&clear_tv)) catch {};
 
         display.printVoterJoined(nick, voter_count);
 
         // Send ballot to new joiner
         self.sendBallot(stream);
 
-        // Enter voter read loop
-        self.voterReadLoop(stream, slot_id);
+        // Enter voter read loop (reuses the persistent reader)
+        self.voterReadLoop(in, slot_id);
 
         // Cleanup on disconnect
         self.removeVoter(stream);
     }
 
-    fn voterReadLoop(self: *Server, stream: std.net.Stream, slot_id: u8) void {
+    fn voterReadLoop(self: *Server, in: *Io.Reader, slot_id: u8) void {
+        const io = self.io;
         while (self.running.load(.monotonic)) {
-            const frame = protocol.readFrame(self.allocator, stream) catch {
+            const frame = protocol.readFrame(self.allocator, in) catch {
                 return;
             };
             defer {
@@ -238,7 +310,7 @@ pub const Server = struct {
                                 return; // disconnect
                             }
                         }
-                        self.voters_mutex.lock();
+                        self.voters_mutex.lockUncancelable(io);
                         for (self.voters.items) |*voter| {
                             if (voter.slot_id == slot_id) {
                                 @memcpy(&voter.pubkey, plaintext[0..32]);
@@ -246,12 +318,12 @@ pub const Server = struct {
                                 break;
                             }
                         }
-                        self.voters_mutex.unlock();
+                        self.voters_mutex.unlock(io);
                     }
                 },
                 .commitment => {
                     if (plaintext.len == 96) { // 32 commitment + 64 signature
-                        self.voters_mutex.lock();
+                        self.voters_mutex.lockUncancelable(io);
                         for (self.voters.items) |*voter| {
                             if (voter.slot_id == slot_id) {
                                 var commitment_val: [32]u8 = undefined;
@@ -269,7 +341,7 @@ pub const Server = struct {
                         }
                         const received = self.countCommitments();
                         const total = self.voters.items.len + 1;
-                        self.voters_mutex.unlock();
+                        self.voters_mutex.unlock(io);
 
                         display.printProgress("Waiting for commitments", received, total);
 
@@ -281,7 +353,7 @@ pub const Server = struct {
                 },
                 .reveal => {
                     if (plaintext.len == 33) { // 1 vote_index + 32 blinding
-                        self.voters_mutex.lock();
+                        self.voters_mutex.lockUncancelable(io);
                         for (self.voters.items) |*voter| {
                             if (voter.slot_id == slot_id) {
                                 const vote_index = plaintext[0];
@@ -300,7 +372,7 @@ pub const Server = struct {
                         }
                         const received = self.countReveals();
                         const total = self.voters.items.len + 1;
-                        self.voters_mutex.unlock();
+                        self.voters_mutex.unlock(io);
 
                         display.printProgress("Waiting for reveals", received, total);
 
@@ -364,10 +436,10 @@ pub const Server = struct {
                 _ = vi;
                 _ = bl;
                 // Host reveal is already stored, count it
-                self.voters_mutex.lock();
+                self.voters_mutex.lockUncancelable(self.io);
                 const received = self.countReveals();
                 const total = self.voters.items.len + 1;
-                self.voters_mutex.unlock();
+                self.voters_mutex.unlock(self.io);
 
                 display.printProgress("Waiting for reveals", received, total);
 
@@ -379,13 +451,14 @@ pub const Server = struct {
     }
 
     fn finishVote(self: *Server) void {
+        const io = self.io;
         display.printStatus("All reveals verified.");
 
-        self.voters_mutex.lock();
+        self.voters_mutex.lockUncancelable(io);
 
         // Collect all reveals including host's
         var all_reveals = std.ArrayList(protocol.Reveal).initCapacity(self.allocator, 0) catch {
-            self.voters_mutex.unlock();
+            self.voters_mutex.unlock(io);
             return;
         };
         defer all_reveals.deinit(self.allocator);
@@ -413,7 +486,7 @@ pub const Server = struct {
         // Compute tally
         const option_count = self.options.len;
         const counts_owned = self.allocator.alloc(u32, option_count) catch {
-            self.voters_mutex.unlock();
+            self.voters_mutex.unlock(io);
             return;
         };
         defer self.allocator.free(counts_owned);
@@ -421,14 +494,14 @@ pub const Server = struct {
 
         // Build roster for artifact
         const roster = self.buildRosterLocked() catch {
-            self.voters_mutex.unlock();
+            self.voters_mutex.unlock(io);
             return;
         };
         defer self.allocator.free(roster);
 
         // Build commitments list
         const all_commitments = self.allocator.alloc(protocol.Commitment, self.voters.items.len + 1) catch {
-            self.voters_mutex.unlock();
+            self.voters_mutex.unlock(io);
             return;
         };
         defer self.allocator.free(all_commitments);
@@ -446,13 +519,14 @@ pub const Server = struct {
             };
         }
 
-        self.voters_mutex.unlock();
+        self.voters_mutex.unlock(io);
 
         display.printResults(self.question, self.options, counts_owned, all_reveals.items.len);
 
         // Build and output artifact
         const json = artifact.buildArtifact(
             self.allocator,
+            io,
             self.session_id,
             self.question,
             self.options,
@@ -475,20 +549,19 @@ pub const Server = struct {
 
         // Output artifact
         if (self.config.output_path) |path| {
-            const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+            const file = Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
                 std.debug.print("Error: cannot write {s}: {}\n", .{ path, err });
                 self.phase.store(@intFromEnum(protocol.Phase.done), .monotonic);
                 self.running.store(false, .monotonic);
                 return;
             };
-            defer file.close();
-            file.writeAll(json) catch {};
-            file.writeAll("\n") catch {};
+            defer file.close(io);
+            file.writeStreamingAll(io, json) catch {};
+            file.writeStreamingAll(io, "\n") catch {};
             std.debug.print("\x1b[38;5;245mArtifact saved to:\x1b[0m {s}\n", .{path});
         } else {
-            const stdout = std.fs.File.stdout();
-            stdout.writeAll(json) catch {};
-            stdout.writeAll("\n") catch {};
+            Io.File.stdout().writeStreamingAll(io, json) catch {};
+            Io.File.stdout().writeStreamingAll(io, "\n") catch {};
         }
 
         self.phase.store(@intFromEnum(protocol.Phase.done), .monotonic);
@@ -496,11 +569,16 @@ pub const Server = struct {
     }
 
     fn shuffleReveals(self: *Server, reveals: []protocol.Reveal) void {
-        _ = self;
         if (reveals.len <= 1) return;
+        // Seed a CSPRNG from the Io entropy source; the shuffle unlinks reveals
+        // from the slot order they arrived in, so it must not be predictable.
+        var seed: [std.Random.ChaCha.secret_seed_length]u8 = undefined;
+        self.io.random(&seed);
+        var csprng = std.Random.ChaCha.init(seed);
+        const random = csprng.random();
         var i = reveals.len - 1;
         while (i > 0) : (i -= 1) {
-            const j = std.crypto.random.uintLessThan(usize, i + 1);
+            const j = random.uintLessThan(usize, i + 1);
             const tmp = reveals[i];
             reveals[i] = reveals[j];
             reveals[j] = tmp;
@@ -508,8 +586,8 @@ pub const Server = struct {
     }
 
     fn buildRoster(self: *Server) ![]protocol.PeerInfo {
-        self.voters_mutex.lock();
-        defer self.voters_mutex.unlock();
+        self.voters_mutex.lockUncancelable(self.io);
+        defer self.voters_mutex.unlock(self.io);
         return self.buildRosterLocked();
     }
 
@@ -547,9 +625,9 @@ pub const Server = struct {
     }
 
     fn broadcastCommitSet(self: *Server) void {
-        self.voters_mutex.lock();
+        self.voters_mutex.lockUncancelable(self.io);
         const commitments = self.allocator.alloc(protocol.Commitment, self.voters.items.len + 1) catch {
-            self.voters_mutex.unlock();
+            self.voters_mutex.unlock(self.io);
             return;
         };
         defer self.allocator.free(commitments);
@@ -566,7 +644,7 @@ pub const Server = struct {
                 .signature = voter.signature orelse [_]u8{0} ** 64,
             };
         }
-        self.voters_mutex.unlock();
+        self.voters_mutex.unlock(self.io);
 
         const set_hash = crypto.computeCommitSetHash(commitments);
         const payload = protocol.serializeCommitSet(self.allocator, commitments, set_hash) catch return;
@@ -576,15 +654,16 @@ pub const Server = struct {
 
     fn broadcastRevealSetLocked(self: *Server, reveals: []const protocol.Reveal) void {
         // Must hold voters_mutex
+        const io = self.io;
         const payload = protocol.serializeRevealSet(self.allocator, reveals) catch return;
         defer self.allocator.free(payload);
 
-        var encrypted = crypto.encrypt(self.allocator, payload, self.key) catch return;
+        var encrypted = crypto.encrypt(self.allocator, io, payload, self.key) catch return;
         defer encrypted.deinit();
 
         const frame = protocol.Frame{
             .msg_type = .reveal_set,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = "system",
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
@@ -592,7 +671,7 @@ pub const Server = struct {
         };
 
         for (self.voters.items) |voter| {
-            protocol.writeFrame(voter.stream, frame) catch {};
+            protocol.sendFrame(io, voter.stream, frame) catch {};
         }
     }
 
@@ -601,50 +680,52 @@ pub const Server = struct {
     }
 
     fn broadcastEncrypted(self: *Server, msg_type: protocol.MessageType, payload: []const u8) void {
-        var encrypted = crypto.encrypt(self.allocator, payload, self.key) catch return;
+        const io = self.io;
+        var encrypted = crypto.encrypt(self.allocator, io, payload, self.key) catch return;
         defer encrypted.deinit();
 
         const frame = protocol.Frame{
             .msg_type = msg_type,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = "system",
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
 
-        self.voters_mutex.lock();
+        self.voters_mutex.lockUncancelable(io);
         for (self.voters.items) |voter| {
-            protocol.writeFrame(voter.stream, frame) catch {};
+            protocol.sendFrame(io, voter.stream, frame) catch {};
         }
-        self.voters_mutex.unlock();
+        self.voters_mutex.unlock(io);
     }
 
-    fn sendBallot(self: *Server, stream: std.net.Stream) void {
+    fn sendBallot(self: *Server, stream: Io.net.Stream) void {
+        const io = self.io;
         const payload = protocol.serializeBallot(self.allocator, self.session_id, self.question, self.options) catch return;
         defer self.allocator.free(payload);
 
-        var encrypted = crypto.encrypt(self.allocator, payload, self.key) catch return;
+        var encrypted = crypto.encrypt(self.allocator, io, payload, self.key) catch return;
         defer encrypted.deinit();
 
         const frame = protocol.Frame{
             .msg_type = .ballot,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = "system",
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
 
-        protocol.writeFrame(stream, frame) catch {};
+        protocol.sendFrame(io, stream, frame) catch {};
     }
 
-    fn removeVoter(self: *Server, stream: std.net.Stream) void {
-        self.voters_mutex.lock();
-        defer self.voters_mutex.unlock();
+    fn removeVoter(self: *Server, stream: Io.net.Stream) void {
+        self.voters_mutex.lockUncancelable(self.io);
+        defer self.voters_mutex.unlock(self.io);
 
         for (self.voters.items, 0..) |voter, i| {
-            if (voter.stream.handle == stream.handle) {
+            if (voter.stream.socket.handle == stream.socket.handle) {
                 const current_phase: protocol.Phase = @enumFromInt(self.phase.load(.monotonic));
                 if (current_phase == .lobby) {
                     display.printVoterLeft(voter.nick, self.voters.items.len); // -1 after remove + host
@@ -657,8 +738,8 @@ pub const Server = struct {
     }
 
     fn resolveNickCollision(self: *Server, nick: []const u8) ![]const u8 {
-        self.voters_mutex.lock();
-        defer self.voters_mutex.unlock();
+        self.voters_mutex.lockUncancelable(self.io);
+        defer self.voters_mutex.unlock(self.io);
 
         var has_collision = std.mem.eql(u8, nick, self.host_nick);
         if (!has_collision) {
@@ -695,13 +776,13 @@ pub const Server = struct {
     }
 
     fn readHostStdin(self: *Server) void {
-        const stdin = std.fs.File.stdin();
+        const io = self.io;
         var buffer: [4096]u8 = undefined;
 
         while (self.running.load(.monotonic)) {
-            const bytes_read = stdin.read(&buffer) catch break;
+            const bytes_read = std.posix.read(std.posix.STDIN_FILENO, &buffer) catch break;
             if (bytes_read == 0) break;
-            const line = std.mem.trimRight(u8, buffer[0..bytes_read], "\n\r");
+            const line = std.mem.trimEnd(u8, buffer[0..bytes_read], "\n\r");
             const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
             if (trimmed.len == 0) continue;
 
@@ -717,9 +798,9 @@ pub const Server = struct {
             switch (current_phase) {
                 .lobby => {
                     if (std.mem.eql(u8, trimmed, "/start")) {
-                        self.voters_mutex.lock();
+                        self.voters_mutex.lockUncancelable(io);
                         const count = self.voters.items.len;
-                        self.voters_mutex.unlock();
+                        self.voters_mutex.unlock(io);
                         if (count == 0) {
                             display.printError("Need at least one other voter to start.");
                             continue;
@@ -740,7 +821,7 @@ pub const Server = struct {
 
                     // Generate commitment
                     var blinding: [32]u8 = undefined;
-                    std.crypto.random.bytes(&blinding);
+                    io.random(&blinding);
                     const commitment_val = crypto.makeCommitment(vote_index, blinding);
                     const sig = crypto.signCommitment(self.roster_hash, commitment_val, self.host_keypair);
 
@@ -752,10 +833,10 @@ pub const Server = struct {
                     display.printStatus("Vote sealed.");
 
                     // Check if all commitments received
-                    self.voters_mutex.lock();
+                    self.voters_mutex.lockUncancelable(io);
                     const received = self.countCommitments();
                     const total = self.voters.items.len + 1;
-                    self.voters_mutex.unlock();
+                    self.voters_mutex.unlock(io);
 
                     display.printProgress("Waiting for commitments", received, total);
 
@@ -771,24 +852,26 @@ pub const Server = struct {
 
     fn pokeListener(self: *Server) void {
         // Make a dummy connection to unblock accept() in the main thread
-        const addr = self.listener.listen_address;
-        if (std.net.tcpConnectToAddress(addr)) |conn| {
-            conn.close();
+        const io = self.io;
+        const addr = Io.net.IpAddress.parse("127.0.0.1", self.port) catch return;
+        if (addr.connect(io, .{ .mode = .stream, .timeout = .none })) |stream| {
+            stream.close(io);
         } else |_| {}
     }
 
     pub fn shutdown(self: *Server) void {
+        const io = self.io;
         self.running.store(false, .monotonic);
 
-        self.voters_mutex.lock();
+        self.voters_mutex.lockUncancelable(io);
         for (self.voters.items) |voter| {
-            voter.stream.close();
+            voter.stream.close(io);
             self.allocator.free(voter.nick);
         }
         self.voters.deinit(self.allocator);
-        self.voters_mutex.unlock();
+        self.voters_mutex.unlock(io);
 
-        self.listener.deinit();
+        self.listener.deinit(io);
 
         std.crypto.secureZero(u8, &self.key);
     }

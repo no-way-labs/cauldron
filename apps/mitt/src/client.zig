@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const crypto = @import("crypto.zig");
 
 pub const SendResult = union(enum) {
@@ -18,25 +19,22 @@ const PayloadData = struct {
     filename: []const u8,
 };
 
-pub fn send(allocator: std.mem.Allocator, host: []const u8, port: u16, payload: Payload, key: [32]u8, timeout_ms: u64) !SendResult {
+const max_payload_bytes = 1024 * 1024 * 1024;
+
+pub fn send(allocator: std.mem.Allocator, io: Io, host: []const u8, port: u16, payload: Payload, key: [32]u8, timeout_ms: u64) !SendResult {
     // Load payload
     const payload_data = switch (payload) {
         .file => |path| blk: {
-            const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-                const err_msg = try std.fmt.allocPrint(allocator, "Failed to open file: {}", .{err});
-                return SendResult{ .failed = .{ .err = err_msg } };
-            };
-            defer file.close();
-
-            const content = file.readToEndAlloc(allocator, 1024 * 1024 * 1024) catch |err| {
+            const content = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_payload_bytes)) catch |err| {
                 const err_msg = try std.fmt.allocPrint(allocator, "Failed to read file: {}", .{err});
                 return SendResult{ .failed = .{ .err = err_msg } };
             };
             break :blk PayloadData{ .data = content, .filename = std.fs.path.basename(path) };
         },
         .stdin => blk: {
-            const stdin = std.fs.File.stdin();
-            const content = stdin.readToEndAlloc(allocator, 1024 * 1024 * 1024) catch |err| {
+            var stdin_buf: [4096]u8 = undefined;
+            var stdin_reader = Io.File.stdin().readerStreaming(io, &stdin_buf);
+            const content = stdin_reader.interface.allocRemaining(allocator, .limited(max_payload_bytes)) catch |err| {
                 const err_msg = try std.fmt.allocPrint(allocator, "Failed to read stdin: {}", .{err});
                 return SendResult{ .failed = .{ .err = err_msg } };
             };
@@ -50,89 +48,76 @@ pub fn send(allocator: std.mem.Allocator, host: []const u8, port: u16, payload: 
     defer allocator.free(payload_data.data);
 
     // Encrypt the data
-    var encrypted = try crypto.encrypt(allocator, payload_data.data, key);
+    var encrypted = try crypto.encrypt(allocator, io, payload_data.data, key);
     defer encrypted.deinit();
 
-    // Connect to server
-    const stream = std.net.tcpConnectToHost(allocator, host, port) catch |err| {
+    // Connect to server. Do NOT pass a connect timeout: Io.Threaded in Zig
+    // 0.16.0 panics "TODO implement netConnectIpPosix with timeout", so the
+    // connect is bounded only by the OS default (same as pre-0.16 behavior);
+    // the send/recv timeouts below bound the transfer itself.
+    const stream = connectToHost(io, host, port, .none) catch |err| {
         const err_msg = try std.fmt.allocPrint(allocator, "Connection failed to {s}:{d}: {}", .{ host, port, err });
         return SendResult{ .failed = .{ .err = err_msg } };
     };
-    defer stream.close();
+    defer stream.close(io);
 
-    // Set socket timeouts
+    // Bound each send/recv so a dead server can't hang the transfer.
     if (timeout_ms > 0) {
-        const timeout_secs: u32 = @intCast(@min(timeout_ms / 1000, std.math.maxInt(u32)));
-        const timeout_usecs: u32 = @intCast((timeout_ms % 1000) * 1000);
-
         const timeout = std.posix.timeval{
-            .sec = @intCast(timeout_secs),
-            .usec = @intCast(timeout_usecs),
+            .sec = @intCast(@min(timeout_ms / 1000, std.math.maxInt(u32))),
+            .usec = @intCast((timeout_ms % 1000) * 1000),
         };
-
-        // Set receive timeout
-        std.posix.setsockopt(
-            stream.handle,
-            std.posix.SOL.SOCKET,
-            std.posix.SO.RCVTIMEO,
-            std.mem.asBytes(&timeout),
-        ) catch |err| {
-            std.debug.print("Warning: Failed to set receive timeout: {}\n", .{err});
-        };
-
-        // Set send timeout
-        std.posix.setsockopt(
-            stream.handle,
-            std.posix.SOL.SOCKET,
-            std.posix.SO.SNDTIMEO,
-            std.mem.asBytes(&timeout),
-        ) catch |err| {
-            std.debug.print("Warning: Failed to set send timeout: {}\n", .{err});
-        };
+        for ([_]u32{ std.posix.SO.RCVTIMEO, std.posix.SO.SNDTIMEO }) |opt| {
+            std.posix.setsockopt(
+                stream.socket.handle,
+                std.posix.SOL.SOCKET,
+                opt,
+                std.mem.asBytes(&timeout),
+            ) catch |err| {
+                std.debug.print("Warning: Failed to set socket timeout: {}\n", .{err});
+            };
+        }
     }
 
-    // Send filename length (u16)
     if (payload_data.filename.len > std.math.maxInt(u16)) {
         const err_msg = try std.fmt.allocPrint(allocator, "Filename too long", .{});
         return SendResult{ .failed = .{ .err = err_msg } };
     }
 
-    var filename_len_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &filename_len_buf, @intCast(payload_data.filename.len), .big);
-    try stream.writeAll(&filename_len_buf);
+    // Protocol: [filename_len: u16][filename][encrypted_size: u64][nonce: 24][tag: 16][ciphertext]
+    var write_buf: [4096]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buf);
+    const out = &stream_writer.interface;
 
-    // Send filename
-    try stream.writeAll(payload_data.filename);
+    try out.writeInt(u16, @intCast(payload_data.filename.len), .big);
+    try out.writeAll(payload_data.filename);
+    try out.writeInt(u64, encrypted.ciphertext.len, .big);
+    try out.writeAll(&encrypted.nonce);
+    try out.writeAll(&encrypted.tag);
+    try out.writeAll(encrypted.ciphertext);
+    try out.flush();
 
-    // Send encrypted data size (u64)
-    var encrypted_size_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &encrypted_size_buf, encrypted.ciphertext.len, .big);
-    try stream.writeAll(&encrypted_size_buf);
-
-    // Send nonce
-    try stream.writeAll(&encrypted.nonce);
-
-    // Send tag
-    try stream.writeAll(&encrypted.tag);
-
-    // Send encrypted data
-    try stream.writeAll(encrypted.ciphertext);
-
-    // Read acknowledgment
-    var ack: [1]u8 = undefined;
-    const n = stream.readAtLeast(&ack, 1) catch {
+    // Read acknowledgment (single byte: 0 = success)
+    var read_buf: [16]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buf);
+    const ack = stream_reader.interface.takeByte() catch {
         const err_msg = try std.fmt.allocPrint(allocator, "No acknowledgment from server", .{});
         return SendResult{ .failed = .{ .err = err_msg } };
     };
-    if (n != 1) {
-        const err_msg = try std.fmt.allocPrint(allocator, "No acknowledgment from server", .{});
-        return SendResult{ .failed = .{ .err = err_msg } };
-    }
 
-    if (ack[0] == 0) {
+    if (ack == 0) {
         return SendResult.delivered;
     } else {
         const err_msg = try std.fmt.allocPrint(allocator, "Server rejected transfer", .{});
         return SendResult{ .failed = .{ .err = err_msg } };
+    }
+}
+
+fn connectToHost(io: Io, host: []const u8, port: u16, timeout: Io.Timeout) !Io.net.Stream {
+    if (Io.net.IpAddress.parse(host, port)) |addr| {
+        return addr.connect(io, .{ .mode = .stream, .timeout = timeout });
+    } else |_| {
+        const host_name = try Io.net.HostName.init(host);
+        return host_name.connect(io, port, .{ .mode = .stream, .timeout = timeout });
     }
 }

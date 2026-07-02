@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const display = @import("display.zig");
@@ -11,7 +12,8 @@ pub const ClientConfig = struct {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    io: Io,
+    stream: Io.net.Stream,
     key: [32]u8,
     nick: []const u8,
     identity: crypto.KeyPair,
@@ -23,25 +25,26 @@ pub const Client = struct {
     // Output
     output_path: ?[]const u8,
 
-    pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16, key: [32]u8, identity: crypto.KeyPair, config: ClientConfig) !Client {
-        const stream = try std.net.tcpConnectToHost(allocator, host, port);
+    pub fn connect(allocator: std.mem.Allocator, io: Io, host: []const u8, port: u16, key: [32]u8, identity: crypto.KeyPair, config: ClientConfig) !Client {
+        const stream = try connectToHost(io, host, port);
 
         // Send JOIN frame with MAGIC
-        var encrypted = try crypto.encrypt(allocator, protocol.MAGIC, key);
+        var encrypted = try crypto.encrypt(allocator, io, protocol.MAGIC, key);
         defer encrypted.deinit();
 
         const join_frame = protocol.Frame{
             .msg_type = .join,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = config.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
-        try protocol.writeFrame(stream, join_frame);
+        try protocol.sendFrame(io, stream, join_frame);
 
         var client = Client{
             .allocator = allocator,
+            .io = io,
             .stream = stream,
             .key = key,
             .nick = config.nick,
@@ -61,23 +64,29 @@ pub const Client = struct {
 
     fn sendPubkey(self: *Client) void {
         const pk_bytes = crypto.publicKeyBytes(self.identity);
-        var encrypted = crypto.encrypt(self.allocator, &pk_bytes, self.key) catch return;
+        var encrypted = crypto.encrypt(self.allocator, self.io, &pk_bytes, self.key) catch return;
         defer encrypted.deinit();
 
         const frame = protocol.Frame{
             .msg_type = .pubkey,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(self.io).toSeconds())),
             .sender = self.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
-        protocol.writeFrame(self.stream, frame) catch {};
+        protocol.sendFrame(self.io, self.stream, frame) catch {};
     }
 
     pub fn run(self: *Client) !void {
+        // One persistent reader for the whole connection: the interface buffers
+        // ahead, so a transient reader per frame would drop bytes.
+        var read_buf: [8192]u8 = undefined;
+        var stream_reader = self.stream.reader(self.io, &read_buf);
+        const in = &stream_reader.interface;
+
         while (self.running.load(.monotonic)) {
-            const frame = protocol.readFrame(self.allocator, self.stream) catch {
+            const frame = protocol.readFrame(self.allocator, in) catch {
                 break;
             };
             defer {
@@ -152,37 +161,37 @@ pub const Client = struct {
         // Sign the roster hash with our identity key
         const sig = crypto.signRoster(self.roster_hash, self.identity);
 
-        var encrypted = crypto.encrypt(self.allocator, &sig, self.key) catch return;
+        var encrypted = crypto.encrypt(self.allocator, self.io, &sig, self.key) catch return;
         defer encrypted.deinit();
 
         const frame = protocol.Frame{
             .msg_type = .signature,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(self.io).toSeconds())),
             .sender = self.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
-        protocol.writeFrame(self.stream, frame) catch return;
+        protocol.sendFrame(self.io, self.stream, frame) catch return;
     }
 
     fn handleCovenant(self: *Client, data: []const u8) void {
         display.printCovenantComplete(if (self.roster) |r| r.len else 0);
 
         if (self.output_path) |path| {
-            const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+            const file = Io.Dir.cwd().createFile(self.io, path, .{}) catch |err| {
                 std.debug.print("Error: cannot write {s}: {}\n", .{ path, err });
                 self.running.store(false, .monotonic);
                 return;
             };
-            defer file.close();
-            file.writeAll(data) catch {};
-            file.writeAll("\n") catch {};
+            defer file.close(self.io);
+            file.writeStreamingAll(self.io, data) catch {};
+            file.writeStreamingAll(self.io, "\n") catch {};
             std.debug.print("\x1b[38;5;245mCovenant saved to:\x1b[0m {s}\n", .{path});
         } else {
-            const stdout = std.fs.File.stdout();
-            stdout.writeAll(data) catch {};
-            stdout.writeAll("\n") catch {};
+            const stdout = Io.File.stdout();
+            stdout.writeStreamingAll(self.io, data) catch {};
+            stdout.writeStreamingAll(self.io, "\n") catch {};
         }
 
         self.running.store(false, .monotonic);
@@ -190,7 +199,7 @@ pub const Client = struct {
 
     pub fn disconnect(self: *Client) void {
         self.running.store(false, .monotonic);
-        self.stream.close();
+        self.stream.close(self.io);
 
         if (self.group_name) |name| self.allocator.free(name);
         if (self.roster) |r| {
@@ -201,3 +210,15 @@ pub const Client = struct {
         std.crypto.secureZero(u8, &self.key);
     }
 };
+
+/// Connect to host:port. Do NOT pass a connect timeout: Io.Threaded in Zig
+/// 0.16.0 panics "TODO implement netConnectIpPosix with timeout", so the
+/// connect is bounded only by the OS default (matching pre-0.16 behavior).
+fn connectToHost(io: Io, host: []const u8, port: u16) !Io.net.Stream {
+    if (Io.net.IpAddress.parse(host, port)) |addr| {
+        return addr.connect(io, .{ .mode = .stream, .timeout = .none });
+    } else |_| {
+        const host_name = try Io.net.HostName.init(host);
+        return host_name.connect(io, port, .{ .mode = .stream, .timeout = .none });
+    }
+}

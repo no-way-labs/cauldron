@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const display = @import("display.zig");
@@ -12,7 +13,8 @@ pub const ClientConfig = struct {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    io: Io,
+    stream: Io.net.Stream,
     key: [32]u8,
     nick: []const u8,
     keypair: crypto.KeyPair,
@@ -35,25 +37,28 @@ pub const Client = struct {
     // Output
     output_path: ?[]const u8,
 
-    pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16, key: [32]u8, keypair: crypto.KeyPair, config: ClientConfig) !Client {
-        const stream = try std.net.tcpConnectToHost(allocator, host, port);
+    pub fn connect(allocator: std.mem.Allocator, io: Io, host: []const u8, port: u16, key: [32]u8, keypair: crypto.KeyPair, config: ClientConfig) !Client {
+        // Do NOT pass a connect timeout: Io.Threaded in Zig 0.16.0 panics
+        // "TODO implement netConnectIpPosix with timeout".
+        const stream = try connectToHost(io, host, port, .none);
 
         // Send JOIN frame with MAGIC
-        var encrypted = try crypto.encrypt(allocator, protocol.MAGIC, key);
+        var encrypted = try crypto.encrypt(allocator, io, protocol.MAGIC, key);
         defer encrypted.deinit();
 
         const join_frame = protocol.Frame{
             .msg_type = .join,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = config.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
-        try protocol.writeFrame(stream, join_frame);
+        try protocol.sendFrame(io, stream, join_frame);
 
         var client = Client{
             .allocator = allocator,
+            .io = io,
             .stream = stream,
             .key = key,
             .nick = config.nick,
@@ -80,25 +85,34 @@ pub const Client = struct {
     }
 
     fn sendPubkey(self: *Client) void {
+        const io = self.io;
         const pk_bytes = crypto.publicKeyBytes(self.keypair);
-        var encrypted = crypto.encrypt(self.allocator, &pk_bytes, self.key) catch return;
+        var encrypted = crypto.encrypt(self.allocator, io, &pk_bytes, self.key) catch return;
         defer encrypted.deinit();
 
         const frame = protocol.Frame{
             .msg_type = .pubkey,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = self.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
-        protocol.writeFrame(self.stream, frame) catch {};
+        protocol.sendFrame(io, self.stream, frame) catch {};
     }
 
     pub fn run(self: *Client) !void {
+        const io = self.io;
+
+        // ONE persistent reader for the connection: the interface buffers ahead,
+        // so every readFrame must share it.
+        var read_buf: [8192]u8 = undefined;
+        var stream_reader = self.stream.reader(io, &read_buf);
+        const in = &stream_reader.interface;
+
         // Read loop - process messages from server
         while (self.running.load(.monotonic)) {
-            const frame = protocol.readFrame(self.allocator, self.stream) catch {
+            const frame = protocol.readFrame(self.allocator, in) catch {
                 break;
             };
             defer {
@@ -187,15 +201,15 @@ pub const Client = struct {
     }
 
     fn promptAndCommit(self: *Client) void {
+        const io = self.io;
         const opts = self.options orelse return;
         display.printVotePrompt(opts);
 
         // Read vote from stdin
-        const stdin = std.fs.File.stdin();
         var buffer: [64]u8 = undefined;
-        const bytes_read = stdin.read(&buffer) catch return;
+        const bytes_read = std.posix.read(std.posix.STDIN_FILENO, &buffer) catch return;
         if (bytes_read == 0) return;
-        const line = std.mem.trimRight(u8, buffer[0..bytes_read], "\n\r");
+        const line = std.mem.trimEnd(u8, buffer[0..bytes_read], "\n\r");
         const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
 
         const choice = std.fmt.parseInt(u8, trimmed, 10) catch {
@@ -210,7 +224,7 @@ pub const Client = struct {
 
         // Generate commitment
         var blinding: [32]u8 = undefined;
-        std.crypto.random.bytes(&blinding);
+        io.random(&blinding);
         const commitment_val = crypto.makeCommitment(vote_index, blinding);
         const sig = crypto.signCommitment(self.roster_hash, commitment_val, self.keypair);
 
@@ -223,18 +237,18 @@ pub const Client = struct {
         @memcpy(payload[0..32], &commitment_val);
         @memcpy(payload[32..96], &sig);
 
-        var encrypted = crypto.encrypt(self.allocator, &payload, self.key) catch return;
+        var encrypted = crypto.encrypt(self.allocator, io, &payload, self.key) catch return;
         defer encrypted.deinit();
 
         const frame = protocol.Frame{
             .msg_type = .commitment,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = self.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
-        protocol.writeFrame(self.stream, frame) catch return;
+        protocol.sendFrame(io, self.stream, frame) catch return;
 
         display.printStatus("Vote sealed. Waiting for all commitments...");
     }
@@ -262,6 +276,7 @@ pub const Client = struct {
     }
 
     fn sendReveal(self: *Client) void {
+        const io = self.io;
         const vi = self.vote_index orelse return;
         const bl = self.blinding_factor orelse return;
 
@@ -269,32 +284,41 @@ pub const Client = struct {
         payload[0] = vi;
         @memcpy(payload[1..33], &bl);
 
-        var encrypted = crypto.encrypt(self.allocator, &payload, self.key) catch return;
+        var encrypted = crypto.encrypt(self.allocator, io, &payload, self.key) catch return;
         defer encrypted.deinit();
 
         const frame = protocol.Frame{
             .msg_type = .reveal,
-            .timestamp = @as(u64, @intCast(std.time.timestamp())),
+            .timestamp = @as(u64, @intCast(Io.Clock.real.now(io).toSeconds())),
             .sender = self.nick,
             .nonce = encrypted.nonce,
             .tag = encrypted.tag,
             .ciphertext = encrypted.ciphertext,
         };
-        protocol.writeFrame(self.stream, frame) catch return;
+        protocol.sendFrame(io, self.stream, frame) catch return;
     }
 
     fn handleRevealSet(self: *Client, data: []const u8) void {
         const reveals = protocol.deserializeRevealSet(self.allocator, data) catch return;
 
+        // Refuse to tally reveals we cannot check against a verified commit set.
+        // A malicious host that withholds/corrupts the commit_set from a targeted
+        // client must not be able to make it display an unverified tally.
+        const commitments = self.commitments orelse {
+            self.allocator.free(reveals);
+            display.printError("No verified commit set — refusing to tally (possible tampering).");
+            self.running.store(false, .monotonic);
+            return;
+        };
+
         // Verify bijection
-        if (self.commitments) |commitments| {
-            verify_mod.verifyRevealSet(reveals, commitments) catch |err| {
-                std.debug.print("Reveal set verification failed: {}\n", .{err});
-                display.printError("Reveal verification failed! Possible tampering.");
-                self.running.store(false, .monotonic);
-                return;
-            };
-        }
+        verify_mod.verifyRevealSet(reveals, commitments) catch |err| {
+            std.debug.print("Reveal set verification failed: {}\n", .{err});
+            display.printError("Reveal verification failed! Possible tampering.");
+            self.allocator.free(reveals);
+            self.running.store(false, .monotonic);
+            return;
+        };
 
         self.reveals = reveals;
 
@@ -308,20 +332,20 @@ pub const Client = struct {
     }
 
     fn handleTally(self: *Client, data: []const u8) void {
+        const io = self.io;
         if (self.output_path) |path| {
-            const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+            const file = Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
                 std.debug.print("Error: cannot write {s}: {}\n", .{ path, err });
                 self.running.store(false, .monotonic);
                 return;
             };
-            defer file.close();
-            file.writeAll(data) catch {};
-            file.writeAll("\n") catch {};
+            defer file.close(io);
+            file.writeStreamingAll(io, data) catch {};
+            file.writeStreamingAll(io, "\n") catch {};
             std.debug.print("\x1b[38;5;245mArtifact saved to:\x1b[0m {s}\n", .{path});
         } else {
-            const stdout = std.fs.File.stdout();
-            stdout.writeAll(data) catch {};
-            stdout.writeAll("\n") catch {};
+            Io.File.stdout().writeStreamingAll(io, data) catch {};
+            Io.File.stdout().writeStreamingAll(io, "\n") catch {};
         }
 
         self.running.store(false, .monotonic);
@@ -329,7 +353,7 @@ pub const Client = struct {
 
     pub fn disconnect(self: *Client) void {
         self.running.store(false, .monotonic);
-        self.stream.close();
+        self.stream.close(self.io);
 
         // Free allocated data
         if (self.question) |q| self.allocator.free(q);
@@ -347,3 +371,12 @@ pub const Client = struct {
         std.crypto.secureZero(u8, &self.key);
     }
 };
+
+fn connectToHost(io: Io, host: []const u8, port: u16, timeout: Io.Timeout) !Io.net.Stream {
+    if (Io.net.IpAddress.parse(host, port)) |addr| {
+        return addr.connect(io, .{ .mode = .stream, .timeout = timeout });
+    } else |_| {
+        const host_name = try Io.net.HostName.init(host);
+        return host_name.connect(io, port, .{ .mode = .stream, .timeout = timeout });
+    }
+}

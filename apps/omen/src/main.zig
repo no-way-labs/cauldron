@@ -1,20 +1,24 @@
 const std = @import("std");
+const Io = std.Io;
 const server_mod = @import("server.zig");
 const client_mod = @import("client.zig");
 const tunnel = @import("tunnel.zig");
 const crypto = @import("crypto.zig");
 const display = @import("display.zig");
 const id = @import("id.zig");
+const verify_mod = @import("verify.zig");
 
 pub const version = "0.1.0";
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_list: std.ArrayList([:0]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    var args_it = std.process.Args.Iterator.init(init.minimal.args);
+    while (args_it.next()) |arg| try args_list.append(allocator, arg);
+    const args = args_list.items;
 
     if (args.len < 2) {
         printUsage();
@@ -30,11 +34,11 @@ pub fn main() !void {
         printUsage();
         return;
     } else if (std.mem.eql(u8, command, "host")) {
-        try handleHost(allocator, args[2..]);
+        try handleHost(allocator, io, init.environ_map, args[2..]);
     } else if (std.mem.eql(u8, command, "join")) {
-        try handleJoin(allocator, args[2..]);
+        try handleJoin(allocator, io, init.environ_map, args[2..]);
     } else if (std.mem.eql(u8, command, "verify")) {
-        try handleVerify(allocator, args[2..]);
+        try handleVerify(allocator, io, args[2..]);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();
@@ -73,7 +77,7 @@ fn printUsage() void {
     , .{});
 }
 
-fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleHost(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const [:0]const u8) !void {
     var port: u16 = 0;
     var bore_port: u16 = 0;
     var local_only = false;
@@ -161,44 +165,46 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         std.process.exit(1);
     }
 
+    // Resolve identity phrase: --identity flag, else OMEN_IDENTITY env.
+    const identity_phrase = try resolveSecret(allocator, environ, identity_opt, "OMEN_IDENTITY");
+    defer if (identity_phrase) |p| allocator.free(p);
+
     // Load covenant roster if provided
     var allowed_pubkeys: ?[][32]u8 = null;
     defer if (allowed_pubkeys) |keys| allocator.free(keys);
 
     if (roster_path) |rpath| {
-        if (identity_opt == null) {
-            std.debug.print("Error: --identity is required when using --roster\n", .{});
+        if (identity_phrase == null) {
+            std.debug.print("Error: --identity (or OMEN_IDENTITY) is required when using --roster\n", .{});
             std.process.exit(1);
         }
-        allowed_pubkeys = loadCovenantPubkeys(allocator, rpath) catch |err| {
+        allowed_pubkeys = loadCovenantPubkeys(allocator, io, rpath) catch |err| {
             std.debug.print("Error: cannot load roster {s}: {}\n", .{ rpath, err });
             std.process.exit(1);
         };
     }
 
     // Derive identity keypair or generate ephemeral
-    const host_keypair = if (identity_opt) |phrase|
-        crypto.deriveIdentity(phrase)
+    const host_keypair = if (identity_phrase) |phrase|
+        crypto.deriveIdentity(io, phrase)
     else
-        crypto.generateKeyPair();
+        crypto.generateKeyPair(io);
 
-    // Generate or use password
-    const password = if (password_opt) |p|
-        try allocator.dupe(u8, p)
-    else
-        try crypto.generatePassword(allocator);
+    // Password: --password flag, else OMEN_PASSWORD env, else auto-generate.
+    const password = (try resolveSecret(allocator, environ, password_opt, "OMEN_PASSWORD")) orelse
+        try crypto.generatePassword(allocator, io);
     defer allocator.free(password);
 
-    const key = crypto.deriveKey(password);
+    const key = crypto.deriveKey(io, password);
 
     // Generate or use nick
     const nick = if (nick_opt) |n|
         try allocator.dupe(u8, n)
     else
-        try id.generate(allocator);
+        try id.generate(allocator, io);
     defer allocator.free(nick);
 
-    var srv = try server_mod.Server.init(allocator, .{
+    var srv = try server_mod.Server.init(allocator, io, .{
         .port = port,
         .max_voters = max_voters,
         .local_only = local_only,
@@ -208,7 +214,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer srv.shutdown();
 
     // Get the actual port the server bound to
-    const actual_port = srv.listener.listen_address.getPort();
+    const actual_port = srv.port;
 
     // Print room info (all to stderr)
     display.printBanner(version);
@@ -225,7 +231,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer if (tun_opt) |*tun| tun.shutdown();
 
     if (!local_only) {
-        if (tunnel.Tunnel.establish(allocator, actual_port, bore_port)) |tun| {
+        if (tunnel.Tunnel.establish(allocator, io, actual_port, bore_port)) |tun| {
             tun_opt = tun;
             tun_opt.?.startMonitor();
             std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}", .{ tun.public_host, tun.public_port });
@@ -241,7 +247,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else |err| {
             if (err == error.PortInUse and bore_port > 0) {
                 std.debug.print("Bore port {d} in use, trying random...\n", .{bore_port});
-                if (tunnel.Tunnel.establish(allocator, actual_port, 0)) |tun| {
+                if (tunnel.Tunnel.establish(allocator, io, actual_port, 0)) |tun| {
                     tun_opt = tun;
                     tun_opt.?.startMonitor();
                     std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}\n", .{ tun.public_host, tun.public_port });
@@ -274,7 +280,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     std.process.exit(0);
 }
 
-fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleJoin(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("Usage: omen join <host:port> --password <pass>\n", .{});
         std.process.exit(1);
@@ -311,19 +317,20 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    if (password_opt == null) {
-        std.debug.print("Error: --password is required\n", .{});
+    const password = (try resolveSecret(allocator, environ, password_opt, "OMEN_PASSWORD")) orelse {
+        std.debug.print("Error: --password (or OMEN_PASSWORD) is required\n", .{});
         std.process.exit(1);
-    }
+    };
+    defer allocator.free(password);
+    const key = crypto.deriveKey(io, password);
 
-    const password = password_opt.?;
-    const key = crypto.deriveKey(password);
-
-    // Derive identity keypair or generate ephemeral
-    const join_keypair = if (join_identity_opt) |phrase|
-        crypto.deriveIdentity(phrase)
+    // Identity phrase: --identity flag, else OMEN_IDENTITY env.
+    const join_identity_phrase = try resolveSecret(allocator, environ, join_identity_opt, "OMEN_IDENTITY");
+    defer if (join_identity_phrase) |p| allocator.free(p);
+    const join_keypair = if (join_identity_phrase) |phrase|
+        crypto.deriveIdentity(io, phrase)
     else
-        crypto.generateKeyPair();
+        crypto.generateKeyPair(io);
 
     // Parse target host:port
     const colon_pos = std.mem.lastIndexOfScalar(u8, target, ':') orelse {
@@ -340,13 +347,13 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const nick = if (nick_opt) |n|
         try allocator.dupe(u8, n)
     else
-        try id.generate(allocator);
+        try id.generate(allocator, io);
     defer allocator.free(nick);
 
     display.printBanner(version);
     std.debug.print("\x1b[38;5;245mConnected as:\x1b[0m {s}\n", .{nick});
 
-    var client = client_mod.Client.connect(allocator, host, port, key, join_keypair, .{
+    var client = client_mod.Client.connect(allocator, io, host, port, key, join_keypair, .{
         .nick = nick,
         .timeout_secs = timeout_secs,
         .output_path = join_output_path,
@@ -361,101 +368,157 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     std.debug.print("\nVote complete.\n", .{});
 }
 
-fn handleVerify(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleVerify(allocator: std.mem.Allocator, io: Io, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("Usage: omen verify <artifact.json>\n", .{});
         std.process.exit(1);
     }
 
     const file_path = args[0];
-    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
-        std.debug.print("Error: cannot open {s}: {}\n", .{ file_path, err });
-        std.process.exit(1);
-    };
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+    const content = Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(1024 * 1024)) catch |err| {
         std.debug.print("Error: cannot read {s}: {}\n", .{ file_path, err });
         std.process.exit(1);
     };
     defer allocator.free(content);
 
-    // For now, just verify the JSON is parseable and print basic info
-    // Full verification would re-check all commitments and reveals
-    std.debug.print("Artifact: {s}\n", .{file_path});
-    std.debug.print("Size: {d} bytes\n", .{content.len});
-    std.debug.print("Verification: basic structure OK\n", .{});
+    var result = verify_mod.verifyArtifact(allocator, content) catch |err| {
+        std.debug.print("\x1b[38;5;196mVerification FAILED: cannot parse artifact ({})\x1b[0m\n", .{err});
+        std.process.exit(1);
+    };
+    defer result.deinit(allocator);
 
-    // TODO: full cryptographic verification
-    // - parse commitments + reveals from JSON
-    // - verify bijection (each reveal opens exactly one commitment)
-    // - verify Ed25519 signatures on commitments
-    // - verify host signature on artifact
-    // - recompute tally and compare
-}
+    std.debug.print("\n\x1b[38;5;45mOmen Artifact Verification\x1b[0m\n\n", .{});
+    std.debug.print("\x1b[38;5;245mFile:\x1b[0m     {s}\n", .{file_path});
+    std.debug.print("\x1b[38;5;245mQuestion:\x1b[0m {s}\n", .{result.question});
+    std.debug.print("\x1b[38;5;245mVoters:\x1b[0m   {d}\n\n", .{result.voter_count});
 
-/// Load pubkeys from a covenant JSON artifact.
-fn loadCovenantPubkeys(allocator: std.mem.Allocator, path: []const u8) ![][32]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    printCheck("Host signature", result.host_sig_valid);
+    printCheck("Roster hash", result.roster_hash_valid);
+    printCheck("Commitment signatures", result.commit_sigs_valid);
+    printCheck("One commitment per roster member", result.roster_complete);
+    printCheck("Reveal bijection", result.bijection_valid);
+    printCheck("Tally recomputation", result.tally_matches);
+    printCheck("Winner matches tally", result.winner_valid);
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(content);
-
-    // Extract pubkeys from members array
-    var pubkeys = try std.ArrayList([32]u8).initCapacity(allocator, 0);
-    errdefer pubkeys.deinit(allocator);
-
-    // Find members array
-    const members_start = std.mem.indexOf(u8, content, "\"members\":[") orelse return error.InvalidCovenant;
-    var pos = members_start + "\"members\":[".len;
-
-    while (pos < content.len) {
-        // Skip whitespace/commas
-        while (pos < content.len and (content[pos] == ' ' or content[pos] == ',' or content[pos] == '\n' or content[pos] == '\r')) : (pos += 1) {}
-        if (pos >= content.len or content[pos] == ']') break;
-        if (content[pos] != '{') break;
-
-        // Find end of member object
-        const obj_start = pos;
-        var depth: usize = 0;
-        while (pos < content.len) : (pos += 1) {
-            if (content[pos] == '{') depth += 1;
-            if (content[pos] == '}') {
-                depth -= 1;
-                if (depth == 0) {
-                    pos += 1;
-                    break;
-                }
-            }
-        }
-        const obj = content[obj_start..pos];
-
-        // Extract pubkey field
-        const pk_needle = "\"pubkey\":\"";
-        const pk_start = (std.mem.indexOf(u8, obj, pk_needle) orelse continue) + pk_needle.len;
-        var pk_end = pk_start;
-        while (pk_end < obj.len and obj[pk_end] != '"') : (pk_end += 1) {}
-        const pk_hex = obj[pk_start..pk_end];
-
-        if (pk_hex.len != 64) continue;
-
-        var pubkey: [32]u8 = undefined;
-        for (0..32) |j| {
-            pubkey[j] = @as(u8, hexVal(pk_hex[j * 2]) orelse continue) << 4 | @as(u8, hexVal(pk_hex[j * 2 + 1]) orelse continue);
-        }
-        try pubkeys.append(allocator, pubkey);
+    std.debug.print("\n\x1b[38;5;245mTally:\x1b[0m\n", .{});
+    for (result.options, 0..) |opt, i| {
+        std.debug.print("  {s}: {d}\n", .{ opt, result.counts[i] });
+    }
+    if (result.winner.len > 0) {
+        std.debug.print("\x1b[38;5;245mWinner:\x1b[0m {s}\n", .{result.winner});
     }
 
-    if (pubkeys.items.len == 0) return error.NoPubkeysFound;
-    return try pubkeys.toOwnedSlice(allocator);
+    std.debug.print("\n", .{});
+    if (result.all_valid) {
+        std.debug.print("\x1b[38;5;82mArtifact is authentic and internally consistent.\x1b[0m\n", .{});
+        std.debug.print("\x1b[38;5;245m(Proves the host did not alter the recorded votes. Voter eligibility\n", .{});
+        std.debug.print(" is only guaranteed if the vote was run with --roster.)\x1b[0m\n\n", .{});
+    } else {
+        std.debug.print("\x1b[38;5;196mVerification FAILED — artifact is tampered or inconsistent.\x1b[0m\n\n", .{});
+        std.process.exit(1);
+    }
 }
 
-fn hexVal(c: u8) ?u4 {
-    return switch (c) {
-        '0'...'9' => @intCast(c - '0'),
-        'a'...'f' => @intCast(c - 'a' + 10),
-        'A'...'F' => @intCast(c - 'A' + 10),
-        else => null,
-    };
+fn printCheck(label: []const u8, ok: bool) void {
+    const mark = if (ok) "\x1b[38;5;82m\xe2\x9c\x93\x1b[0m" else "\x1b[38;5;196m\xe2\x9c\x97\x1b[0m";
+    std.debug.print("  {s} {s}\n", .{ mark, label });
+}
+
+/// Resolve a secret from an explicit flag, else an environment variable, so it
+/// need not appear in argv (visible in `ps`) or shell history. An exported-but-
+/// empty variable is treated as unset — deriving a key from "" would produce a
+/// deterministic, publicly reproducible secret. Returns owned memory the caller
+/// frees, or null if neither source provided a non-empty value.
+fn resolveSecret(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, flag: ?[]const u8, env_name: []const u8) !?[]u8 {
+    if (flag) |f| return try allocator.dupe(u8, f);
+    const value = environ.get(env_name) orelse return null;
+    if (value.len == 0) return null; // exported-but-empty == unset
+    return try allocator.dupe(u8, value);
+}
+
+/// Read a covenant JSON artifact from disk and return its member pubkeys.
+fn loadCovenantPubkeys(allocator: std.mem.Allocator, io: Io, path: []const u8) ![][32]u8 {
+    const content = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+    defer allocator.free(content);
+    return parseCovenantPubkeys(allocator, content);
+}
+
+/// Parse the covenant member pubkeys (the voter-eligibility allowlist) from a
+/// covenant JSON artifact using std.json, so whitespace/pretty-printed layouts
+/// parse identically. A malformed member — missing, non-hex, or wrong-length
+/// pubkey — is a HARD error, never a skip: silently dropping an entry would
+/// silently disenfranchise that member. An empty roster is `NoPubkeysFound`.
+fn parseCovenantPubkeys(allocator: std.mem.Allocator, json: []const u8) ![][32]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.InvalidCovenant;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCovenant;
+
+    const members_val = parsed.value.object.get("members") orelse return error.InvalidCovenant;
+    if (members_val != .array) return error.InvalidCovenant;
+    const members = members_val.array.items;
+
+    if (members.len == 0) return error.NoPubkeysFound;
+
+    var pubkeys = try allocator.alloc([32]u8, members.len);
+    errdefer allocator.free(pubkeys);
+
+    for (members, 0..) |member, i| {
+        if (member != .object) return error.InvalidCovenant;
+        const pk_val = member.object.get("pubkey") orelse return error.InvalidCovenant;
+        if (pk_val != .string or pk_val.string.len != 64) return error.InvalidCovenant;
+        _ = std.fmt.hexToBytes(&pubkeys[i], pk_val.string) catch return error.InvalidCovenant;
+    }
+
+    return pubkeys;
+}
+
+// In Zig 0.16 `zig test main.zig` only discovers tests declared in the root
+// file; pull in the module tests (protocol framing/fuzz, verify's artifact and
+// security checks, crypto, id) so a single `zig test` on this entrypoint
+// exercises the whole suite.
+test {
+    _ = @import("crypto.zig");
+    _ = @import("protocol.zig");
+    _ = @import("verify.zig");
+    _ = @import("id.zig");
+}
+
+test "parseCovenantPubkeys parses pretty-printed JSON" {
+    const allocator = std.testing.allocator;
+    const json =
+        "{\n" ++
+        "  \"members\": [\n" ++
+        "    { \"nick\": \"alice\", \"pubkey\": \"" ++ ("aa" ** 32) ++ "\" },\n" ++
+        "    { \"nick\": \"bob\",   \"pubkey\": \"" ++ ("bb" ** 32) ++ "\" }\n" ++
+        "  ]\n" ++
+        "}";
+    const keys = try parseCovenantPubkeys(allocator, json);
+    defer allocator.free(keys);
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqual(@as(u8, 0xaa), keys[0][0]);
+    try std.testing.expectEqual(@as(u8, 0xbb), keys[1][31]);
+}
+
+test "parseCovenantPubkeys rejects malformed pubkey hex" {
+    const allocator = std.testing.allocator;
+    // 'zz' is not valid hex — a hard error, not a silently dropped member.
+    const json = "{\"members\":[{\"pubkey\":\"" ++ ("zz" ** 32) ++ "\"}]}";
+    try std.testing.expectError(error.InvalidCovenant, parseCovenantPubkeys(allocator, json));
+}
+
+test "parseCovenantPubkeys rejects wrong-length pubkey" {
+    const allocator = std.testing.allocator;
+    const json = "{\"members\":[{\"pubkey\":\"abcd\"}]}";
+    try std.testing.expectError(error.InvalidCovenant, parseCovenantPubkeys(allocator, json));
+}
+
+test "parseCovenantPubkeys rejects a member missing its pubkey" {
+    const allocator = std.testing.allocator;
+    const json = "{\"members\":[{\"nick\":\"alice\"}]}";
+    try std.testing.expectError(error.InvalidCovenant, parseCovenantPubkeys(allocator, json));
+}
+
+test "parseCovenantPubkeys rejects empty members" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.NoPubkeysFound, parseCovenantPubkeys(allocator, "{\"members\":[]}"));
 }

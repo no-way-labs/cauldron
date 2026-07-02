@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 pub const MAX_NICK_LEN: u8 = 32;
 pub const MAX_PAYLOAD_LEN: u32 = 65536;
@@ -35,70 +36,63 @@ pub const Frame = struct {
     ciphertext: []const u8,
 };
 
-pub fn writeFrame(stream: std.net.Stream, frame: Frame) !void {
-    var type_buf: [1]u8 = .{@intFromEnum(frame.msg_type)};
-    try stream.writeAll(&type_buf);
-
-    var timestamp_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &timestamp_buf, frame.timestamp, .big);
-    try stream.writeAll(&timestamp_buf);
+/// Serialize a frame onto a writer interface. Does NOT flush — the caller
+/// flushes after (possibly batching several frames). Fuzzable via a fixed
+/// writer.
+pub fn writeFrame(out: *Io.Writer, frame: Frame) !void {
+    try out.writeByte(@intFromEnum(frame.msg_type));
+    try out.writeInt(u64, frame.timestamp, .big);
 
     const sender_len: u8 = @min(@as(u8, @intCast(frame.sender.len)), MAX_NICK_LEN);
-    var sender_len_buf: [1]u8 = .{sender_len};
-    try stream.writeAll(&sender_len_buf);
-    try stream.writeAll(frame.sender[0..sender_len]);
+    try out.writeByte(sender_len);
+    try out.writeAll(frame.sender[0..sender_len]);
 
-    var payload_len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &payload_len_buf, @intCast(frame.ciphertext.len), .big);
-    try stream.writeAll(&payload_len_buf);
+    try out.writeInt(u32, @intCast(frame.ciphertext.len), .big);
 
-    try stream.writeAll(&frame.nonce);
-    try stream.writeAll(&frame.tag);
-    try stream.writeAll(frame.ciphertext);
+    try out.writeAll(&frame.nonce);
+    try out.writeAll(&frame.tag);
+    try out.writeAll(frame.ciphertext);
 }
 
-pub fn readFrame(allocator: std.mem.Allocator, stream: std.net.Stream) !Frame {
-    var type_buf: [1]u8 = undefined;
-    const n0 = try stream.readAtLeast(&type_buf, 1);
-    if (n0 < 1) return error.UnexpectedEOF;
-    const msg_type = std.meta.intToEnum(MessageType, type_buf[0]) catch {
+/// Convenience for one-shot sends: write a single frame to a stream with a
+/// transient writer and flush. Per-connection read loops keep a persistent
+/// reader (see server/client), but writes are stateless so a fresh writer per
+/// frame is fine — and safe to call while holding the members mutex.
+pub fn sendFrame(io: Io, stream: Io.net.Stream, frame: Frame) !void {
+    var write_buf: [4096]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buf);
+    try writeFrame(&stream_writer.interface, frame);
+    try stream_writer.interface.flush();
+}
+
+/// Parse a frame from a reader interface. Callers pass the persistent
+/// per-connection reader's `&reader.interface` so buffered bytes survive across
+/// frames. Fuzzable via `Io.Reader.fixed`.
+pub fn readFrame(allocator: std.mem.Allocator, in: *Io.Reader) !Frame {
+    const msg_type = std.enums.fromInt(MessageType, try in.takeByte()) orelse
         return error.InvalidMessageType;
-    };
 
-    var timestamp_buf: [8]u8 = undefined;
-    const n1 = try stream.readAtLeast(&timestamp_buf, 8);
-    if (n1 < 8) return error.UnexpectedEOF;
-    const timestamp = std.mem.readInt(u64, &timestamp_buf, .big);
+    const timestamp = try in.takeInt(u64, .big);
 
-    var sender_len_buf: [1]u8 = undefined;
-    const n2 = try stream.readAtLeast(&sender_len_buf, 1);
-    if (n2 < 1) return error.UnexpectedEOF;
-    const sender_len = sender_len_buf[0];
+    const sender_len = try in.takeByte();
     if (sender_len > MAX_NICK_LEN) return error.SenderTooLong;
 
     const sender = try allocator.alloc(u8, sender_len);
     errdefer allocator.free(sender);
-    const n3 = try stream.readAtLeast(sender, sender_len);
-    if (n3 < sender_len) return error.UnexpectedEOF;
+    try in.readSliceAll(sender);
 
-    var payload_len_buf: [4]u8 = undefined;
-    const n4 = try stream.readAtLeast(&payload_len_buf, 4);
-    if (n4 < 4) return error.UnexpectedEOF;
-    const payload_len = std.mem.readInt(u32, &payload_len_buf, .big);
+    const payload_len = try in.takeInt(u32, .big);
     if (payload_len > MAX_PAYLOAD_LEN) return error.PayloadTooLarge;
 
     var nonce: [24]u8 = undefined;
-    const n5 = try stream.readAtLeast(&nonce, 24);
-    if (n5 < 24) return error.UnexpectedEOF;
+    try in.readSliceAll(&nonce);
 
     var tag: [16]u8 = undefined;
-    const n6 = try stream.readAtLeast(&tag, 16);
-    if (n6 < 16) return error.UnexpectedEOF;
+    try in.readSliceAll(&tag);
 
     const ciphertext = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(ciphertext);
-    const n7 = try stream.readAtLeast(ciphertext, payload_len);
-    if (n7 < payload_len) return error.UnexpectedEOF;
+    try in.readSliceAll(ciphertext);
 
     return Frame{
         .msg_type = msg_type,
@@ -139,8 +133,15 @@ pub fn deserializeRoster(allocator: std.mem.Allocator, data: []const u8) ![]Memb
     var pos: usize = 1;
 
     var members = try allocator.alloc(MemberInfo, count);
-    errdefer allocator.free(members);
+    // `parsed` counts only fully-initialized entries (a nick is duped and the
+    // slot assigned before it is incremented), so on a mid-parse error the
+    // errdefer frees exactly those nicks — the truncated slot in progress has
+    // no allocation yet — plus the backing array.
     var parsed: usize = 0;
+    errdefer {
+        for (members[0..parsed]) |m| allocator.free(m.nick);
+        allocator.free(members);
+    }
 
     while (parsed < count) : (parsed += 1) {
         if (pos + 1 > data.len) return error.InvalidPayload;
@@ -161,4 +162,72 @@ pub fn deserializeRoster(allocator: std.mem.Allocator, data: []const u8) ![]Memb
 /// Serialize phase transition: phase_id [1]
 pub fn serializePhase(phase: Phase) [1]u8 {
     return .{@intFromEnum(phase)};
+}
+
+// --- Fuzz tests for the untrusted-input parsers ---
+//
+// In 0.16 `std.testing.fuzz` hands the callback a `*std.testing.Smith` value
+// generator rather than a raw `[]const u8`. A plain `zig test` replays each
+// corpus entry (fed as `Smith.in`) plus one empty input, so these double as
+// regression tests; `zig build test --fuzz` drives them with real fuzzer input.
+// `smith.slice(&buf)` yields a variable-length byte slice — it first reads a
+// little-endian u32 length prefix, so `seed` wraps each raw corpus payload with
+// that prefix.
+
+/// Wrap raw parser bytes as a `Smith.slice` seed (LE u32 length prefix + bytes).
+fn seed(comptime payload: []const u8) []const u8 {
+    const out = comptime blk: {
+        var buf: [4 + payload.len]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], @intCast(payload.len), .little);
+        @memcpy(buf[4..], payload);
+        break :blk buf;
+    };
+    return &out;
+}
+
+fn fuzzDeserializeRoster(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+    const members = deserializeRoster(std.testing.allocator, buf[0..n]) catch return;
+    defer {
+        for (members) |m| std.testing.allocator.free(m.nick);
+        std.testing.allocator.free(members);
+    }
+}
+
+test "fuzz deserializeRoster" {
+    try std.testing.fuzz({}, fuzzDeserializeRoster, .{
+        .corpus = &.{
+            seed("\x01\x01a" ++ ("\x00" ** 32)), // valid 1-member roster
+            seed("\x01\x01a"), // truncated: nick but no pubkey
+            seed("\xff\x01a"), // count 255 >> available data
+            // Two members where the second is truncated: the first nick is duped
+            // before the parse fails, so this catches the error-path nick leak.
+            seed("\x02" ++ "\x01a" ++ ("\x00" ** 32) ++ "\x01b"),
+        },
+    });
+}
+
+fn fuzzReadFrame(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+    var r = Io.Reader.fixed(buf[0..n]);
+    const frame = readFrame(std.testing.allocator, &r) catch return;
+    var mutable = frame;
+    freeFrame(std.testing.allocator, &mutable);
+}
+
+test "fuzz readFrame" {
+    // Wire format: type[1] ts[8] sender_len[1] sender[N] payload_len[4 BE]
+    // nonce[24] tag[16] ciphertext[payload_len].
+    try std.testing.fuzz({}, fuzzReadFrame, .{
+        .corpus = &.{
+            // Valid join frame, empty payload: sender "a", payload_len 0, then
+            // 4-byte length + 24-byte nonce + 16-byte tag = 44 trailing zeros.
+            seed("\x01" ++ ("\x00" ** 8) ++ "\x01a" ++ ("\x00" ** 44)),
+            seed("\x01\x00"), // truncated before the timestamp
+            // sender_len 0, payload_len 0xffffffff -> PayloadTooLarge before alloc.
+            seed("\x01" ++ ("\x00" ** 8) ++ "\x00" ++ "\xff\xff\xff\xff"),
+        },
+    });
 }

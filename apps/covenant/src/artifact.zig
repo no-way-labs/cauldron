@@ -19,6 +19,7 @@ pub const SignedMember = struct {
 /// Build the JSON covenant artifact.
 pub fn buildCovenant(
     allocator: std.mem.Allocator,
+    io: std.Io,
     group_name: []const u8,
     session_id: [32]u8,
     roster_hash: [32]u8,
@@ -38,7 +39,7 @@ pub fn buildCovenant(
     try json.appendSlice(allocator, "\",");
 
     // created_at
-    const ts = @as(u64, @intCast(std.time.timestamp()));
+    const ts = @as(u64, @intCast(std.Io.Clock.real.now(io).toSeconds()));
     try appendFmt(allocator, &json, "\"created_at\":{d},", .{ts});
 
     // session_id

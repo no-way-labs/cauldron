@@ -1,35 +1,27 @@
 const std = @import("std");
+const Io = std.Io;
 
 pub const SaveResult = struct {
     path: []const u8,
     bytes: u64,
 };
 
-pub fn save(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, reader: std.io.AnyReader) !SaveResult {
-    std.fs.cwd().makePath(dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+pub fn save(allocator: std.mem.Allocator, io: Io, dir: []const u8, filename: []const u8, reader: *Io.Reader) !SaveResult {
+    try makePath(io, dir);
 
-    var dir_handle = try std.fs.cwd().openDir(dir, .{});
-    defer dir_handle.close();
+    var dir_handle = try Io.Dir.cwd().openDir(io, dir, .{});
+    defer dir_handle.close(io);
 
-    const final_filename = try findAvailableFilename(allocator, dir_handle, filename);
+    const final_filename = try findAvailableFilename(allocator, io, dir_handle, filename);
     defer allocator.free(final_filename);
 
-    var file = try dir_handle.createFile(final_filename, .{});
-    defer file.close();
+    var file = try dir_handle.createFile(io, final_filename, .{});
+    defer file.close(io);
 
-    var bytes_written: u64 = 0;
-    var buffer: [8192]u8 = undefined;
-
-    while (true) {
-        const bytes_read = try reader.read(&buffer);
-        if (bytes_read == 0) break;
-
-        try file.writeAll(buffer[0..bytes_read]);
-        bytes_written += bytes_read;
-    }
+    var write_buf: [8192]u8 = undefined;
+    var file_writer = file.writer(io, &write_buf);
+    const bytes_written = try reader.streamRemaining(&file_writer.interface);
+    try file_writer.interface.flush();
 
     const full_path = try std.fs.path.join(allocator, &[_][]const u8{ dir, final_filename });
 
@@ -39,8 +31,20 @@ pub fn save(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8,
     };
 }
 
-fn findAvailableFilename(allocator: std.mem.Allocator, dir: std.fs.Dir, filename: []const u8) ![]const u8 {
-    dir.access(filename, .{}) catch {
+/// Recursively create a directory path (0.16's Io.Dir has no makePath).
+fn makePath(io: Io, path: []const u8) !void {
+    var it = std.mem.tokenizeScalar(u8, path, '/');
+    while (it.next()) |component| {
+        const end = @intFromPtr(component.ptr) - @intFromPtr(path.ptr) + component.len;
+        Io.Dir.cwd().createDir(io, path[0..end], .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+}
+
+fn findAvailableFilename(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, filename: []const u8) ![]const u8 {
+    dir.access(io, filename, .{}) catch {
         return try allocator.dupe(u8, filename);
     };
 
@@ -53,7 +57,7 @@ fn findAvailableFilename(allocator: std.mem.Allocator, dir: std.fs.Dir, filename
         const candidate = try std.fmt.allocPrint(allocator, "{s}_{d}{s}", .{ base, counter, ext });
         errdefer allocator.free(candidate);
 
-        dir.access(candidate, .{}) catch {
+        dir.access(io, candidate, .{}) catch {
             return candidate;
         };
 
@@ -65,21 +69,19 @@ fn findAvailableFilename(allocator: std.mem.Allocator, dir: std.fs.Dir, filename
 
 test "save writes file to disk" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     const test_dir = "test_inbox";
-    defer std.fs.cwd().deleteTree(test_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, test_dir) catch {};
 
     const data = "Hello, World!";
-    var fbs = std.io.fixedBufferStream(data);
-    const reader = fbs.reader().any();
+    var reader = Io.Reader.fixed(data);
 
-    const result = try save(allocator, test_dir, "test.txt", reader);
+    const result = try save(allocator, io, test_dir, "test.txt", &reader);
     defer allocator.free(result.path);
 
     try std.testing.expectEqual(@as(u64, data.len), result.bytes);
 
-    const file = try std.fs.cwd().openFile(result.path, .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 1024);
+    const content = try Io.Dir.cwd().readFileAlloc(io, result.path, allocator, .limited(1024));
     defer allocator.free(content);
 
     try std.testing.expectEqualStrings(data, content);
@@ -87,24 +89,23 @@ test "save writes file to disk" {
 
 test "save handles filename collisions" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     const test_dir = "test_inbox_collision";
-    defer std.fs.cwd().deleteTree(test_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, test_dir) catch {};
 
     const data1 = "First file";
-    var fbs1 = std.io.fixedBufferStream(data1);
-    const result1 = try save(allocator, test_dir, "test.txt", fbs1.reader().any());
+    var reader1 = Io.Reader.fixed(data1);
+    const result1 = try save(allocator, io, test_dir, "test.txt", &reader1);
     defer allocator.free(result1.path);
 
     const data2 = "Second file";
-    var fbs2 = std.io.fixedBufferStream(data2);
-    const result2 = try save(allocator, test_dir, "test.txt", fbs2.reader().any());
+    var reader2 = Io.Reader.fixed(data2);
+    const result2 = try save(allocator, io, test_dir, "test.txt", &reader2);
     defer allocator.free(result2.path);
 
     try std.testing.expect(!std.mem.eql(u8, result1.path, result2.path));
 
-    const file2 = try std.fs.cwd().openFile(result2.path, .{});
-    defer file2.close();
-    const content2 = try file2.readToEndAlloc(allocator, 1024);
+    const content2 = try Io.Dir.cwd().readFileAlloc(io, result2.path, allocator, .limited(1024));
     defer allocator.free(content2);
 
     try std.testing.expectEqualStrings(data2, content2);

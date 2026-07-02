@@ -36,87 +36,78 @@ pub const Frame = struct {
     ciphertext: []const u8,
 };
 
-pub fn writeFrame(stream: std.net.Stream, frame: Frame) !void {
+/// Write a frame to a buffered writer. Does NOT flush — the caller flushes
+/// after (possibly batching). Kept interface-based so it is directly fuzzable
+/// via `std.Io.Writer.fixed`; `sendFrame` wraps it for stream senders.
+pub fn writeFrame(out: *std.Io.Writer, frame: Frame) !void {
     // Write msg_type
-    var type_buf: [1]u8 = .{@intFromEnum(frame.msg_type)};
-    try stream.writeAll(&type_buf);
+    try out.writeByte(@intFromEnum(frame.msg_type));
 
     // Write timestamp (u64 big-endian)
-    var timestamp_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &timestamp_buf, frame.timestamp, .big);
-    try stream.writeAll(&timestamp_buf);
+    try out.writeInt(u64, frame.timestamp, .big);
 
     // Write sender_len and sender (clamped to MAX_NICK_LEN)
     const sender_len: u8 = @min(@as(u8, @intCast(frame.sender.len)), MAX_NICK_LEN);
-    var sender_len_buf: [1]u8 = .{sender_len};
-    try stream.writeAll(&sender_len_buf);
-    try stream.writeAll(frame.sender[0..sender_len]);
+    try out.writeByte(sender_len);
+    try out.writeAll(frame.sender[0..sender_len]);
 
     // Write payload_len (u32 big-endian)
-    var payload_len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &payload_len_buf, @intCast(frame.ciphertext.len), .big);
-    try stream.writeAll(&payload_len_buf);
+    try out.writeInt(u32, @intCast(frame.ciphertext.len), .big);
 
     // Write nonce
-    try stream.writeAll(&frame.nonce);
+    try out.writeAll(&frame.nonce);
 
     // Write tag
-    try stream.writeAll(&frame.tag);
+    try out.writeAll(&frame.tag);
 
     // Write ciphertext
-    try stream.writeAll(frame.ciphertext);
+    try out.writeAll(frame.ciphertext);
 }
 
-pub fn readFrame(allocator: std.mem.Allocator, stream: std.net.Stream) !Frame {
+/// Send a single frame over a stream: transient buffered writer + flush. Safe
+/// to call under a mutex; the small buffer drains as needed for large frames.
+pub fn sendFrame(io: std.Io, stream: std.Io.net.Stream, frame: Frame) !void {
+    var write_buf: [4096]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buf);
+    try writeFrame(&stream_writer.interface, frame);
+    try stream_writer.interface.flush();
+}
+
+/// Read a frame from a persistent per-connection reader. The reader buffers
+/// ahead, so callers must create ONE reader per connection and reuse it.
+pub fn readFrame(allocator: std.mem.Allocator, in: *std.Io.Reader) !Frame {
     // Read msg_type
-    var type_buf: [1]u8 = undefined;
-    const n0 = try stream.readAtLeast(&type_buf, 1);
-    if (n0 < 1) return error.UnexpectedEOF;
-    const msg_type = std.meta.intToEnum(MessageType, type_buf[0]) catch {
-        return error.InvalidMessageType;
-    };
+    const type_byte = try in.takeByte();
+    const msg_type = std.enums.fromInt(MessageType, type_byte) orelse return error.InvalidMessageType;
 
     // Read timestamp (u64 big-endian)
-    var timestamp_buf: [8]u8 = undefined;
-    const n1 = try stream.readAtLeast(&timestamp_buf, 8);
-    if (n1 < 8) return error.UnexpectedEOF;
-    const timestamp = std.mem.readInt(u64, &timestamp_buf, .big);
+    const timestamp = try in.takeInt(u64, .big);
 
     // Read sender_len
-    var sender_len_buf: [1]u8 = undefined;
-    const n2 = try stream.readAtLeast(&sender_len_buf, 1);
-    if (n2 < 1) return error.UnexpectedEOF;
-    const sender_len = sender_len_buf[0];
+    const sender_len = try in.takeByte();
     if (sender_len > MAX_NICK_LEN) return error.SenderTooLong;
 
     // Read sender
     const sender = try allocator.alloc(u8, sender_len);
     errdefer allocator.free(sender);
-    const n3 = try stream.readAtLeast(sender, sender_len);
-    if (n3 < sender_len) return error.UnexpectedEOF;
+    try in.readSliceAll(sender);
 
     // Read payload_len (u32 big-endian)
-    var payload_len_buf: [4]u8 = undefined;
-    const n4 = try stream.readAtLeast(&payload_len_buf, 4);
-    if (n4 < 4) return error.UnexpectedEOF;
-    const payload_len = std.mem.readInt(u32, &payload_len_buf, .big);
+    const payload_len = try in.takeInt(u32, .big);
     if (payload_len > MAX_PAYLOAD_LEN) return error.PayloadTooLarge;
 
     // Read nonce
     var nonce: [24]u8 = undefined;
-    const n5 = try stream.readAtLeast(&nonce, 24);
-    if (n5 < 24) return error.UnexpectedEOF;
+    try in.readSliceAll(&nonce);
 
     // Read tag
     var tag: [16]u8 = undefined;
-    const n6 = try stream.readAtLeast(&tag, 16);
-    if (n6 < 16) return error.UnexpectedEOF;
+    try in.readSliceAll(&tag);
 
     // Read ciphertext
     const ciphertext = try allocator.alloc(u8, payload_len);
     errdefer allocator.free(ciphertext);
-    const n7 = try stream.readAtLeast(ciphertext, payload_len);
-    if (n7 < payload_len) return error.UnexpectedEOF;
+    try in.readSliceAll(ciphertext);
 
     return Frame{
         .msg_type = msg_type,
@@ -200,11 +191,13 @@ pub fn deserializeBallot(allocator: std.mem.Allocator, data: []const u8) !struct
     pos += 1;
 
     var options = try allocator.alloc([]const u8, option_count);
+    var parsed: usize = 0;
+    // Only options[0..parsed] have been duped; the rest are undefined, so a
+    // mid-parse error must free only what was actually allocated.
     errdefer {
-        for (options) |opt| allocator.free(opt);
+        for (options[0..parsed]) |opt| allocator.free(opt);
         allocator.free(options);
     }
-    var parsed: usize = 0;
 
     while (parsed < option_count) : (parsed += 1) {
         if (pos + 2 > data.len) return error.InvalidPayload;
@@ -241,8 +234,13 @@ pub fn deserializePeerList(allocator: std.mem.Allocator, data: []const u8) ![]Pe
     var pos: usize = 1;
 
     var peers = try allocator.alloc(PeerInfo, count);
-    errdefer allocator.free(peers);
     var parsed: usize = 0;
+    // Each parsed peer owns a duped nick; free those too on a mid-parse error,
+    // not just the array, or they leak.
+    errdefer {
+        for (peers[0..parsed]) |peer| allocator.free(peer.nick);
+        allocator.free(peers);
+    }
 
     while (parsed < count) : (parsed += 1) {
         if (pos + 2 > data.len) return error.InvalidPayload;
@@ -351,4 +349,89 @@ pub fn deserializeRevealSet(allocator: std.mem.Allocator, data: []const u8) ![]R
     }
 
     return reveals;
+}
+
+// --- Fuzz harnesses ---
+//
+// In 0.16 `std.testing.fuzz` hands the callback a `*std.testing.Smith` value
+// generator rather than a raw `[]const u8`. A plain `zig test` replays each
+// corpus entry (fed as `Smith.in`) plus one empty input, so these double as
+// regression tests; `zig build test --fuzz` drives them with real fuzzer input.
+// `smith.slice(&buf)` yields a variable-length byte slice — it first reads a
+// little-endian u32 length prefix, so `seed` wraps each raw payload with it.
+// A panic or a leak (checked by the testing allocator) is the failure signal.
+
+/// Wrap raw parser bytes as a `Smith.slice` seed (LE u32 length prefix + bytes).
+fn seed(comptime payload: []const u8) []const u8 {
+    const out = comptime blk: {
+        var buf: [4 + payload.len]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], @intCast(payload.len), .little);
+        @memcpy(buf[4..], payload);
+        break :blk buf;
+    };
+    return &out;
+}
+
+fn fuzzDeserializers(_: void, smith: *std.testing.Smith) anyerror!void {
+    const a = std.testing.allocator;
+    var buf: [4096]u8 = undefined;
+    const input = buf[0..smith.slice(&buf)];
+
+    if (deserializeBallot(a, input)) |b| {
+        a.free(b.question);
+        for (b.options) |o| a.free(o);
+        a.free(b.options);
+    } else |_| {}
+
+    if (deserializePeerList(a, input)) |peers| {
+        for (peers) |p| a.free(p.nick);
+        a.free(peers);
+    } else |_| {}
+
+    if (deserializeCommitSet(a, input)) |cs| {
+        a.free(cs.commitments);
+    } else |_| {}
+
+    if (deserializeRevealSet(a, input)) |rs| {
+        a.free(rs);
+    } else |_| {}
+}
+
+test "fuzz payload deserializers" {
+    try std.testing.fuzz({}, fuzzDeserializers, .{
+        .corpus = &.{
+            // One valid encoding of each payload type.
+            seed(("\x00" ** 32) ++ "\x00\x01?" ++ "\x02" ++ "\x00\x03yes" ++ "\x00\x02no"), // ballot
+            seed("\x01\x00\x04host" ++ ("\x00" ** 32)), // peer list
+            seed("\x01\x00" ++ ("\x00" ** 32) ++ ("\x00" ** 64) ++ ("\x00" ** 32)), // commit set
+            seed("\x01\x00" ++ ("\x00" ** 32)), // reveal set
+            // Ballot claiming 2 options but only 1 present: option[0] is duped
+            // before the parse fails — exercises the ballot error-path free.
+            seed(("\x00" ** 32) ++ "\x00\x01?" ++ "\x02" ++ "\x00\x03yes"),
+            // Peer list claiming 2 peers, the second truncated: peer[0].nick is
+            // duped before the parse fails — exercises the nick error-path free.
+            seed("\x02" ++ "\x00\x04host" ++ ("\x00" ** 32) ++ "\x01\x03bob"),
+        },
+    });
+}
+
+fn fuzzReadFrame(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    var r = std.Io.Reader.fixed(buf[0..smith.slice(&buf)]);
+    var frame = readFrame(std.testing.allocator, &r) catch return;
+    freeFrame(std.testing.allocator, &frame);
+}
+
+test "fuzz readFrame" {
+    // Wire: type[1] ts[8] sender_len[1] sender[N] payload_len[4 BE] nonce[24]
+    // tag[16] ciphertext[payload_len].
+    try std.testing.fuzz({}, fuzzReadFrame, .{
+        .corpus = &.{
+            // Valid join frame, sender "a", empty payload (4+24+16 = 44 zeros).
+            seed("\x01" ++ ("\x00" ** 8) ++ "\x01a" ++ ("\x00" ** 44)),
+            seed("\x01\x00"), // truncated before the timestamp
+            // sender_len 0, payload_len 0xffffffff -> PayloadTooLarge before alloc.
+            seed("\x01" ++ ("\x00" ** 8) ++ "\x00" ++ "\xff\xff\xff\xff"),
+        },
+    });
 }

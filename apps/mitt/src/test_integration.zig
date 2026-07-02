@@ -69,21 +69,20 @@ test "server rejects non-whitelisted extension" {
 
 test "storage saves file correctly" {
     const allocator = testing.allocator;
+    const io = testing.io;
     const test_dir = "test_storage_inbox";
-    defer std.fs.cwd().deleteTree(test_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
 
     const data = "Hello, World!";
-    var fbs = std.io.fixedBufferStream(data);
+    var reader = std.Io.Reader.fixed(data);
 
-    const result = try storage.save(allocator, test_dir, "test.txt", fbs.reader().any());
+    const result = try storage.save(allocator, io, test_dir, "test.txt", &reader);
     defer allocator.free(result.path);
 
     try testing.expectEqual(@as(u64, data.len), result.bytes);
 
     // Verify file contents
-    const file = try std.fs.cwd().openFile(result.path, .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 1024);
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, result.path, allocator, .limited(1024));
     defer allocator.free(content);
 
     try testing.expectEqualStrings(data, content);
@@ -91,19 +90,20 @@ test "storage saves file correctly" {
 
 test "storage handles filename collisions" {
     const allocator = testing.allocator;
+    const io = testing.io;
     const test_dir = "test_collision_inbox";
-    defer std.fs.cwd().deleteTree(test_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
 
     // Save first file
     const data1 = "First file";
-    var fbs1 = std.io.fixedBufferStream(data1);
-    const result1 = try storage.save(allocator, test_dir, "test.txt", fbs1.reader().any());
+    var reader1 = std.Io.Reader.fixed(data1);
+    const result1 = try storage.save(allocator, io, test_dir, "test.txt", &reader1);
     defer allocator.free(result1.path);
 
     // Save second file with same name
     const data2 = "Second file";
-    var fbs2 = std.io.fixedBufferStream(data2);
-    const result2 = try storage.save(allocator, test_dir, "test.txt", fbs2.reader().any());
+    var reader2 = std.Io.Reader.fixed(data2);
+    const result2 = try storage.save(allocator, io, test_dir, "test.txt", &reader2);
     defer allocator.free(result2.path);
 
     // Paths should be different
@@ -113,9 +113,7 @@ test "storage handles filename collisions" {
     try testing.expect(std.mem.indexOf(u8, result2.path, "test_1.txt") != null);
 
     // Verify both files exist with correct contents
-    const file2 = try std.fs.cwd().openFile(result2.path, .{});
-    defer file2.close();
-    const content2 = try file2.readToEndAlloc(allocator, 1024);
+    const content2 = try std.Io.Dir.cwd().readFileAlloc(io, result2.path, allocator, .limited(1024));
     defer allocator.free(content2);
 
     try testing.expectEqualStrings(data2, content2);
@@ -124,7 +122,7 @@ test "storage handles filename collisions" {
 test "id generation produces valid format" {
     const allocator = testing.allocator;
 
-    const generated_id = try id.generate(allocator);
+    const generated_id = try id.generate(allocator, testing.io);
     defer allocator.free(generated_id);
 
     // Should have at least 2 hyphens (word-word-number)
@@ -171,37 +169,36 @@ test "multiple file types filter" {
 
 test "storage creates directory if not exists" {
     const allocator = testing.allocator;
+    const io = testing.io;
     const test_dir = "test_new_dir/subdir/inbox";
-    defer std.fs.cwd().deleteTree("test_new_dir") catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, "test_new_dir") catch {};
 
     const data = "Test content";
-    var fbs = std.io.fixedBufferStream(data);
+    var reader = std.Io.Reader.fixed(data);
 
-    const result = try storage.save(allocator, test_dir, "file.txt", fbs.reader().any());
+    const result = try storage.save(allocator, io, test_dir, "file.txt", &reader);
     defer allocator.free(result.path);
 
     // Verify directory was created and file exists
-    const file = try std.fs.cwd().openFile(result.path, .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().openFile(io, result.path, .{});
+    file.close(io);
 }
 
 test "client payload data handling" {
     const allocator = testing.allocator;
+    const io = testing.io;
 
     // Create a test file
     const test_file_path = "test_client_file.txt";
     {
-        const file = try std.fs.cwd().createFile(test_file_path, .{});
-        defer file.close();
-        try file.writeAll("Test data for client");
+        var file = try std.Io.Dir.cwd().createFile(io, test_file_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "Test data for client");
     }
-    defer std.fs.cwd().deleteFile(test_file_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, test_file_path) catch {};
 
     // Test that we can read the file (simulating what the client does)
-    const file = try std.fs.cwd().openFile(test_file_path, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 1024);
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, test_file_path, allocator, .limited(1024));
     defer allocator.free(content);
 
     try testing.expectEqualStrings("Test data for client", content);

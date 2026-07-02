@@ -5,7 +5,10 @@ set -e
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 echo "Building all apps..."
-zig build
+# ReleaseSafe: optimized, but keeps runtime safety checks (bounds, overflow,
+# @intCast/@enumFromInt) so malformed network input panics instead of becoming
+# undefined behavior. Matches what CI ships.
+zig build -Doptimize=ReleaseSafe
 
 echo "Creating install directory: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"

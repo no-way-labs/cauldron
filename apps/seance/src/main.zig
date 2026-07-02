@@ -8,13 +8,15 @@ const id = @import("id.zig");
 
 pub const version = "0.2.8";
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_list: std.ArrayList([:0]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    var args_it = std.process.Args.Iterator.init(init.minimal.args);
+    while (args_it.next()) |arg| try args_list.append(allocator, arg);
+    const args = args_list.items;
 
     if (args.len < 2) {
         printUsage();
@@ -27,9 +29,9 @@ pub fn main() !void {
         std.debug.print("seance {s}\n", .{version});
         return;
     } else if (std.mem.eql(u8, command, "host")) {
-        try handleHost(allocator, args[2..]);
+        try handleHost(allocator, io, init.environ_map, args[2..]);
     } else if (std.mem.eql(u8, command, "join")) {
-        try handleJoin(allocator, args[2..]);
+        try handleJoin(allocator, io, init.environ_map, args[2..]);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();
@@ -74,7 +76,7 @@ fn printUsage() void {
     , .{});
 }
 
-fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleHost(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, args: []const [:0]const u8) !void {
     var port: u16 = 0;
     var bore_port: u16 = 0;
     var local_only = false;
@@ -114,23 +116,21 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    // Generate or use password
-    const password = if (password_opt) |p|
-        try allocator.dupe(u8, p)
-    else
-        try crypto.generatePassword(allocator);
+    // Password: --password flag, else SEANCE_PASSWORD env var, else auto-generate.
+    const password = (try resolveSecret(allocator, environ, password_opt, "SEANCE_PASSWORD")) orelse
+        try crypto.generatePassword(allocator, io);
     defer allocator.free(password);
 
-    const key = crypto.deriveKey(password);
+    const key = crypto.deriveKey(io, password);
 
     // Generate or use nick
     const nick = if (nick_opt) |n|
         try allocator.dupe(u8, n)
     else
-        try id.generate(allocator);
+        try id.generate(allocator, io);
     defer allocator.free(nick);
 
-    var srv = try server_mod.Server.init(allocator, .{
+    var srv = try server_mod.Server.init(allocator, io, .{
         .port = port,
         .max_peers = max_peers,
         .local_only = local_only,
@@ -138,7 +138,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer srv.shutdown();
 
     // Get the actual port the server bound to
-    const actual_port = srv.listener.listen_address.getPort();
+    const actual_port = srv.port;
 
     // Print room info
     printBanner();
@@ -151,7 +151,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer if (tun_opt) |*tun| tun.shutdown();
 
     if (!local_only) {
-        if (tunnel.Tunnel.establish(allocator, actual_port, bore_port)) |tun| {
+        if (tunnel.Tunnel.establish(allocator, io, actual_port, bore_port)) |tun| {
             tun_opt = tun;
             tun_opt.?.startMonitor();
             std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}", .{ tun.public_host, tun.public_port });
@@ -170,7 +170,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else |err| {
             if (err == error.PortInUse and bore_port > 0) {
                 std.debug.print("Bore port {d} in use, trying random...\n", .{bore_port});
-                if (tunnel.Tunnel.establish(allocator, actual_port, 0)) |tun| {
+                if (tunnel.Tunnel.establish(allocator, io, actual_port, 0)) |tun| {
                     tun_opt = tun;
                     tun_opt.?.startMonitor();
                     std.debug.print("\x1b[38;5;245mPublic:\x1b[0m {s}:{d}\n", .{ tun.public_host, tun.public_port });
@@ -204,7 +204,7 @@ fn handleHost(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     try srv.run();
 }
 
-fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn handleJoin(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("Usage: seance join <host:port> --password <pass>\n", .{});
         std.process.exit(1);
@@ -247,13 +247,13 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    if (password_opt == null) {
-        std.debug.print("Error: --password is required\n", .{});
+    // Password: --password flag, else SEANCE_PASSWORD env var, else error.
+    const password = (try resolveSecret(allocator, environ, password_opt, "SEANCE_PASSWORD")) orelse {
+        std.debug.print("Error: --password or SEANCE_PASSWORD is required\n", .{});
         std.process.exit(1);
-    }
-
-    const password = password_opt.?;
-    const key = crypto.deriveKey(password);
+    };
+    defer allocator.free(password);
+    const key = crypto.deriveKey(io, password);
 
     // Parse target host:port
     const colon_pos = std.mem.lastIndexOfScalar(u8, target, ':') orelse {
@@ -270,13 +270,13 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const nick = if (nick_opt) |n|
         try allocator.dupe(u8, n)
     else
-        try id.generate(allocator);
+        try id.generate(allocator, io);
     defer allocator.free(nick);
 
     printBanner();
     std.debug.print("\x1b[38;5;245mNick:\x1b[0m {s}\n\n", .{nick});
 
-    var client = client_mod.Client.connect(allocator, host, port, key, .{
+    var client = client_mod.Client.connect(allocator, io, host, port, key, .{
         .nick = nick,
         .timeout_secs = timeout_secs,
     }) catch |err| {
@@ -292,11 +292,36 @@ fn handleJoin(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         std.debug.print("  GET  /peers      - list participants\n", .{});
         std.debug.print("  GET  /nick       - get bot's nick\n", .{});
         std.debug.print("  POST /quit       - disconnect\n\n", .{});
-        try client.runBot(api_port, run_familiar);
+        try client.runBot(api_port, run_familiar, environ);
     } else {
         std.debug.print("\x1b[38;5;141mConnected!\x1b[38;5;240m Type /quit to leave.\x1b[0m\n\n", .{});
         try client.run();
     }
 
     std.debug.print("\nDisconnected.\n", .{});
+}
+
+/// Resolve a secret from an explicit flag, else an environment variable, so it
+/// need not appear in argv (visible in `ps`) or shell history. An exported-but-
+/// empty variable is treated as unset — deriving a key from "" would produce a
+/// deterministic, publicly reproducible secret. Returns owned memory the caller
+/// frees, or null if neither source provided a non-empty value.
+fn resolveSecret(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, flag: ?[]const u8, env_name: []const u8) !?[]u8 {
+    if (flag) |f| return try allocator.dupe(u8, f);
+    const value = environ.get(env_name) orelse return null;
+    if (value.len == 0) return null; // exported-but-empty == unset
+    return try allocator.dupe(u8, value);
+}
+
+// 0.16 `zig test <root>` only runs the root file's own tests; pull in every
+// sibling module so their test blocks are discovered by the gate command.
+test {
+    _ = @import("crypto.zig");
+    _ = @import("id.zig");
+    _ = @import("protocol.zig");
+    _ = @import("server.zig");
+    _ = @import("client.zig");
+    _ = @import("bot.zig");
+    _ = @import("display.zig");
+    _ = @import("tunnel.zig");
 }
