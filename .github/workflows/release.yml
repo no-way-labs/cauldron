@@ -293,7 +293,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout homebrew tap
-        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen' && steps.app.outputs.name != 'covenant'
         uses: actions/checkout@v4
         with:
           repository: no-way-labs/homebrew-cauldron
@@ -301,40 +300,32 @@ jobs:
           path: homebrew-tap
 
       - name: Update Homebrew formula
-        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen' && steps.app.outputs.name != 'covenant'
         run: |
           APP="${{ steps.app.outputs.name }}"
           TAG="${{ github.ref_name }}"
           VERSION="${{ steps.app.outputs.version }}"
+          FORMULA="homebrew-tap/Formula/$APP.rb"
 
-          if [ "$APP" = "seance" ]; then
-            ARM64_SHA=$(cat artifacts/seance-macos-aarch64/*.sha256 | awk '{print $1}')
-            X86_64_SHA=$(cat artifacts/seance-macos-x86_64/*.sha256 | awk '{print $1}')
-            LINUX_ARM64_SHA=$(cat artifacts/seance-linux-aarch64/*.sha256 | awk '{print $1}')
-            LINUX_X86_64_SHA=$(cat artifacts/seance-linux-x86_64/*.sha256 | awk '{print $1}')
-
-            sed -i "s/version \".*\"/version \"${VERSION#v}\"/" homebrew-tap/Formula/seance.rb
-            sed -i "s|download/seance-v[0-9.]*\/|download/$TAG/|g" homebrew-tap/Formula/seance.rb
-            sed -i "/seance-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" homebrew-tap/Formula/seance.rb
-            sed -i "/seance-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" homebrew-tap/Formula/seance.rb
-            sed -i "/seance-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" homebrew-tap/Formula/seance.rb
-            sed -i "/seance-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" homebrew-tap/Formula/seance.rb
-          else
-            ARM64_SHA=$(cat artifacts/mitt-macos-aarch64/*.sha256 | awk '{print $1}')
-            X86_64_SHA=$(cat artifacts/mitt-macos-x86_64/*.sha256 | awk '{print $1}')
-            LINUX_ARM64_SHA=$(cat artifacts/mitt-linux-aarch64/*.sha256 | awk '{print $1}')
-            LINUX_X86_64_SHA=$(cat artifacts/mitt-linux-x86_64/*.sha256 | awk '{print $1}')
-
-            sed -i "s/version \".*\"/version \"${VERSION#v}\"/" homebrew-tap/Formula/mitt.rb
-            sed -i "s|download/v[0-9.]*\/|download/$VERSION/|g" homebrew-tap/Formula/mitt.rb
-            sed -i "/mitt-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" homebrew-tap/Formula/mitt.rb
-            sed -i "/mitt-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" homebrew-tap/Formula/mitt.rb
-            sed -i "/mitt-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" homebrew-tap/Formula/mitt.rb
-            sed -i "/mitt-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" homebrew-tap/Formula/mitt.rb
+          if [ ! -f "$FORMULA" ]; then
+            echo "No formula for $APP in the tap; skipping formula update." >&2
+            echo "skip=true" >> "$GITHUB_ENV"
+            exit 0
           fi
 
+          ARM64_SHA=$(cat artifacts/$APP-macos-aarch64/*.sha256 | awk '{print $1}')
+          X86_64_SHA=$(cat artifacts/$APP-macos-x86_64/*.sha256 | awk '{print $1}')
+          LINUX_ARM64_SHA=$(cat artifacts/$APP-linux-aarch64/*.sha256 | awk '{print $1}')
+          LINUX_X86_64_SHA=$(cat artifacts/$APP-linux-x86_64/*.sha256 | awk '{print $1}')
+
+          sed -i "s/version \".*\"/version \"${VERSION#v}\"/" "$FORMULA"
+          sed -i "s|download/[^/]*/|download/$TAG/|g" "$FORMULA"
+          sed -i "/$APP-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" "$FORMULA"
+          sed -i "/$APP-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" "$FORMULA"
+          sed -i "/$APP-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" "$FORMULA"
+          sed -i "/$APP-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" "$FORMULA"
+
       - name: Push updated formula
-        if: steps.app.outputs.name != 'familiar' && steps.app.outputs.name != 'omen' && steps.app.outputs.name != 'covenant'
+        if: env.skip != 'true'
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
