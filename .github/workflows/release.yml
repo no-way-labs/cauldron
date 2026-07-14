@@ -3,296 +3,205 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
-      - 'seance-v*'
-      - 'familiar-v*'
-      - 'omen-v*'
-      - 'covenant-v*'
+      - "v*"
+      - "seance-v*"
+      - "familiar-v*"
+      - "omen-v*"
+      - "covenant-v*"
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., v0.1.0 or seance-v0.1.0)'
+        description: "Existing immutable tag to release (for example v0.5.0 or seance-v0.3.0)"
         required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
+  metadata:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.release.outputs.app }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Resolve app and version
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            app="mitt"
+            version="${BASH_REMATCH[1]}"
+          elif [[ "$tag" =~ ^(seance|familiar|omen|covenant)-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            app="${BASH_REMATCH[1]}"
+            version="${BASH_REMATCH[2]}"
+          else
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate immutable tag exists
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
   build:
     name: Build ${{ matrix.artifact }}
-    runs-on: ${{ matrix.os }}
+    needs: metadata
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # mitt
-          - app: mitt
-            os: macos-latest
-            zig_target: aarch64-macos
-            artifact: mitt-macos-aarch64
-          - app: mitt
-            os: macos-latest
-            zig_target: x86_64-macos
-            artifact: mitt-macos-x86_64
-          - app: mitt
-            os: ubuntu-latest
-            zig_target: x86_64-linux
-            artifact: mitt-linux-x86_64
-          - app: mitt
-            os: ubuntu-latest
-            zig_target: aarch64-linux
-            artifact: mitt-linux-aarch64
-          # seance
-          - app: seance
-            os: macos-latest
-            zig_target: aarch64-macos
-            artifact: seance-macos-aarch64
-          - app: seance
-            os: macos-latest
-            zig_target: x86_64-macos
-            artifact: seance-macos-x86_64
-          - app: seance
-            os: ubuntu-latest
-            zig_target: x86_64-linux
-            artifact: seance-linux-x86_64
-          - app: seance
-            os: ubuntu-latest
-            zig_target: aarch64-linux
-            artifact: seance-linux-aarch64
-          # familiar
-          - app: familiar
-            os: macos-latest
-            zig_target: aarch64-macos
-            artifact: familiar-macos-aarch64
-          - app: familiar
-            os: macos-latest
-            zig_target: x86_64-macos
-            artifact: familiar-macos-x86_64
-          - app: familiar
-            os: ubuntu-latest
-            zig_target: x86_64-linux
-            artifact: familiar-linux-x86_64
-          - app: familiar
-            os: ubuntu-latest
-            zig_target: aarch64-linux
-            artifact: familiar-linux-aarch64
-          # omen
-          - app: omen
-            os: macos-latest
-            zig_target: aarch64-macos
-            artifact: omen-macos-aarch64
-          - app: omen
-            os: macos-latest
-            zig_target: x86_64-macos
-            artifact: omen-macos-x86_64
-          - app: omen
-            os: ubuntu-latest
-            zig_target: x86_64-linux
-            artifact: omen-linux-x86_64
-          - app: omen
-            os: ubuntu-latest
-            zig_target: aarch64-linux
-            artifact: omen-linux-aarch64
-          # covenant
-          - app: covenant
-            os: macos-latest
-            zig_target: aarch64-macos
-            artifact: covenant-macos-aarch64
-          - app: covenant
-            os: macos-latest
-            zig_target: x86_64-macos
-            artifact: covenant-macos-x86_64
-          - app: covenant
-            os: ubuntu-latest
-            zig_target: x86_64-linux
-            artifact: covenant-linux-x86_64
-          - app: covenant
-            os: ubuntu-latest
-            zig_target: aarch64-linux
-            artifact: covenant-linux-aarch64
-
+          - { app: mitt, goos: darwin, goarch: arm64, artifact: mitt-macos-aarch64 }
+          - { app: mitt, goos: darwin, goarch: amd64, artifact: mitt-macos-x86_64 }
+          - { app: mitt, goos: linux, goarch: arm64, artifact: mitt-linux-aarch64 }
+          - { app: mitt, goos: linux, goarch: amd64, artifact: mitt-linux-x86_64 }
+          - { app: seance, goos: darwin, goarch: arm64, artifact: seance-macos-aarch64 }
+          - { app: seance, goos: darwin, goarch: amd64, artifact: seance-macos-x86_64 }
+          - { app: seance, goos: linux, goarch: arm64, artifact: seance-linux-aarch64 }
+          - { app: seance, goos: linux, goarch: amd64, artifact: seance-linux-x86_64 }
+          - { app: familiar, goos: darwin, goarch: arm64, artifact: familiar-macos-aarch64 }
+          - { app: familiar, goos: darwin, goarch: amd64, artifact: familiar-macos-x86_64 }
+          - { app: familiar, goos: linux, goarch: arm64, artifact: familiar-linux-aarch64 }
+          - { app: familiar, goos: linux, goarch: amd64, artifact: familiar-linux-x86_64 }
+          - { app: omen, goos: darwin, goarch: arm64, artifact: omen-macos-aarch64 }
+          - { app: omen, goos: darwin, goarch: amd64, artifact: omen-macos-x86_64 }
+          - { app: omen, goos: linux, goarch: arm64, artifact: omen-linux-aarch64 }
+          - { app: omen, goos: linux, goarch: amd64, artifact: omen-linux-x86_64 }
+          - { app: covenant, goos: darwin, goarch: arm64, artifact: covenant-macos-aarch64 }
+          - { app: covenant, goos: darwin, goarch: amd64, artifact: covenant-macos-x86_64 }
+          - { app: covenant, goos: linux, goarch: arm64, artifact: covenant-linux-aarch64 }
+          - { app: covenant, goos: linux, goarch: amd64, artifact: covenant-linux-x86_64 }
     steps:
-      - name: Check if this app should build
-        id: check
-        run: |
-          TAG="${{ github.ref_name }}"
-          APP="${{ matrix.app }}"
-          if [[ "$TAG" == seance-v* && "$APP" == "seance" ]]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == familiar-v* && "$APP" == "familiar" ]]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == omen-v* && "$APP" == "omen" ]]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == covenant-v* && "$APP" == "covenant" ]]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == v* && ! "$TAG" == seance-v* && ! "$TAG" == familiar-v* && ! "$TAG" == omen-v* && ! "$TAG" == covenant-v* && "$APP" == "mitt" ]]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_build=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Checkout code
-        if: steps.check.outputs.should_build == 'true'
+      - name: Checkout immutable tag
+        if: matrix.app == needs.metadata.outputs.app
         uses: actions/checkout@v4
-
-      - name: Setup Zig
-        if: steps.check.outputs.should_build == 'true'
-        uses: goto-bus-stop/setup-zig@v2
         with:
-          version: 0.16.0
+          ref: ${{ needs.metadata.outputs.tag }}
 
-      - name: Build
-        if: steps.check.outputs.should_build == 'true'
-        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+      - name: Set up Go
+        if: matrix.app == needs.metadata.outputs.app
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
-      - name: Package binary
-        if: steps.check.outputs.should_build == 'true'
+      - name: Build static binary
+        if: matrix.app == needs.metadata.outputs.app
+        shell: bash
+        env:
+          APP: ${{ matrix.app }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp zig-out/bin/${{ matrix.app }} dist/
+          go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/$APP" "./cmd/$APP"
+
+      - name: Verify injected version
+        if: matrix.app == needs.metadata.outputs.app && matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        shell: bash
+        env:
+          APP: ${{ matrix.app }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          output="$("dist/$APP" --version 2>&1)"
+          echo "$output"
+          grep -F "$VERSION" <<<"$output"
+
+      - name: Package binary and checksum
+        if: matrix.app == needs.metadata.outputs.app
+        shell: bash
+        env:
+          APP: ${{ matrix.app }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
           cd dist
-          tar -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.app }}
-          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256 2>/dev/null || shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          cp ../LICENSE ../THIRD_PARTY_NOTICES .
+          tar -czf "$ARTIFACT.tar.gz" "$APP" LICENSE THIRD_PARTY_NOTICES
+          sha256sum "$ARTIFACT.tar.gz" > "$ARTIFACT.tar.gz.sha256"
 
       - name: Upload artifact
-        if: steps.check.outputs.should_build == 'true'
+        if: matrix.app == needs.metadata.outputs.app
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
+          if-no-files-found: error
           path: |
             dist/${{ matrix.artifact }}.tar.gz
             dist/${{ matrix.artifact }}.tar.gz.sha256
 
   release:
-    name: Create Release
-    needs: build
+    name: Publish ${{ needs.metadata.outputs.tag }}
+    needs: [metadata, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - name: Checkout code
+      - name: Checkout immutable tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
 
-      - name: Download all artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Determine app from tag
-        id: app
-        run: |
-          TAG="${{ github.ref_name }}"
-          if [[ "$TAG" == seance-v* ]]; then
-            echo "name=seance" >> $GITHUB_OUTPUT
-            echo "version=${TAG#seance-}" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == familiar-v* ]]; then
-            echo "name=familiar" >> $GITHUB_OUTPUT
-            echo "version=${TAG#familiar-}" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == omen-v* ]]; then
-            echo "name=omen" >> $GITHUB_OUTPUT
-            echo "version=${TAG#omen-}" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == covenant-v* ]]; then
-            echo "name=covenant" >> $GITHUB_OUTPUT
-            echo "version=${TAG#covenant-}" >> $GITHUB_OUTPUT
-          else
-            echo "name=mitt" >> $GITHUB_OUTPUT
-            echo "version=$TAG" >> $GITHUB_OUTPUT
-          fi
-
       - name: Create release notes
+        shell: bash
+        env:
+          APP: ${{ needs.metadata.outputs.app }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          APP="${{ steps.app.outputs.name }}"
-          if [ "$APP" = "seance" ]; then
-            cat > release_notes.md << 'EOF'
-          # seance ${{ github.ref_name }}
+          set -euo pipefail
+          case "$APP" in
+            mitt) description="Encrypted, ephemeral file and data transfer." ;;
+            seance) description="Ephemeral encrypted group chat with a loopback bot API." ;;
+            familiar) description="Claude-powered participant for seance rooms." ;;
+            omen) description="Encrypted, verifiable commit-reveal voting. The v1 artifact is linkable and does not provide ballot anonymity." ;;
+            covenant) description="Mutually signed membership ceremonies and strict artifact verification." ;;
+          esac
+          {
+            echo "# $APP $VERSION"
+            echo
+            echo "$description"
+            echo
+            echo "Download the archive for your platform, verify its SHA-256 sidecar, and extract the binary. See the repository README and SECURITY.md for usage and threat-model details."
+            echo
+            echo "## SHA-256 checksums"
+            echo '```text'
+            find artifacts -name '*.sha256' -type f -exec cat {} + | sort
+            echo '```'
+          } > release_notes.md
 
-          Ephemeral encrypted P2P group chat. No accounts, no history, no cloud.
-
-          ## Installation
-
-          ### Homebrew (macOS/Linux)
-          ```bash
-          brew tap no-way-labs/cauldron
-          brew install seance
-          ```
-
-          ### Manual Installation
-          Download the appropriate binary for your platform below and extract it.
-
-          ## SHA256 Checksums
-          EOF
-          elif [ "$APP" = "familiar" ]; then
-            cat > release_notes.md << 'EOF'
-          # familiar ${{ github.ref_name }}
-
-          Autonomous Claude-powered chat bot for seance rooms.
-
-          ## Installation
-
-          ### Manual Installation
-          Download the appropriate binary for your platform below and extract it.
-
-          ## SHA256 Checksums
-          EOF
-          elif [ "$APP" = "omen" ]; then
-            cat > release_notes.md << 'EOF'
-          # omen ${{ github.ref_name }}
-
-          Anonymous encrypted voting CLI. No accounts, no history, no cloud.
-
-          ## Installation
-
-          ### Manual Installation
-          Download the appropriate binary for your platform below and extract it.
-
-          ## SHA256 Checksums
-          EOF
-          elif [ "$APP" = "covenant" ]; then
-            cat > release_notes.md << 'EOF'
-          # covenant ${{ github.ref_name }}
-
-          Membership signing ceremony CLI. No accounts, no history, no cloud.
-
-          ## Installation
-
-          ### Manual Installation
-          Download the appropriate binary for your platform below and extract it.
-
-          ## SHA256 Checksums
-          EOF
-          else
-            cat > release_notes.md << 'EOF'
-          # mitt ${{ github.ref_name }}
-
-          An encrypted file transfer CLI tool.
-
-          ## Installation
-
-          ### Homebrew (macOS/Linux)
-          ```bash
-          brew tap no-way-labs/cauldron
-          brew install mitt
-          ```
-
-          ### Manual Installation
-          Download the appropriate binary for your platform below and extract it.
-
-          ## SHA256 Checksums
-          EOF
-          fi
-
-          for file in artifacts/*/*.sha256; do
-            [ -f "$file" ] && cat "$file" >> release_notes.md
-          done
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*/*.tar.gz
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          files: |
+            artifacts/*/*.tar.gz
+            artifacts/*/*.sha256
           body_path: release_notes.md
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Checkout homebrew tap
+      - name: Checkout Homebrew tap
         uses: actions/checkout@v4
         with:
           repository: no-way-labs/homebrew-cauldron
@@ -300,36 +209,51 @@ jobs:
           path: homebrew-tap
 
       - name: Update Homebrew formula
+        shell: bash
+        env:
+          APP: ${{ needs.metadata.outputs.app }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          APP="${{ steps.app.outputs.name }}"
-          TAG="${{ github.ref_name }}"
-          VERSION="${{ steps.app.outputs.version }}"
-          FORMULA="homebrew-tap/Formula/$APP.rb"
-
-          if [ ! -f "$FORMULA" ]; then
-            echo "No formula for $APP in the tap; skipping formula update." >&2
-            echo "skip=true" >> "$GITHUB_ENV"
+          set -euo pipefail
+          formula="homebrew-tap/Formula/$APP.rb"
+          if [ ! -f "$formula" ]; then
+            echo "No formula for $APP; skipping formula update." >&2
+            echo "skip_formula=true" >> "$GITHUB_ENV"
             exit 0
           fi
 
-          ARM64_SHA=$(cat artifacts/$APP-macos-aarch64/*.sha256 | awk '{print $1}')
-          X86_64_SHA=$(cat artifacts/$APP-macos-x86_64/*.sha256 | awk '{print $1}')
-          LINUX_ARM64_SHA=$(cat artifacts/$APP-linux-aarch64/*.sha256 | awk '{print $1}')
-          LINUX_X86_64_SHA=$(cat artifacts/$APP-linux-x86_64/*.sha256 | awk '{print $1}')
+          arm64_sha="$(awk '{print $1}' artifacts/$APP-macos-aarch64/*.sha256)"
+          x86_64_sha="$(awk '{print $1}' artifacts/$APP-macos-x86_64/*.sha256)"
+          linux_arm64_sha="$(awk '{print $1}' artifacts/$APP-linux-aarch64/*.sha256)"
+          linux_x86_64_sha="$(awk '{print $1}' artifacts/$APP-linux-x86_64/*.sha256)"
 
-          sed -i "s/version \".*\"/version \"${VERSION#v}\"/" "$FORMULA"
-          sed -i "s|download/[^/]*/|download/$TAG/|g" "$FORMULA"
-          sed -i "/$APP-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$ARM64_SHA\"/" "$FORMULA"
-          sed -i "/$APP-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$X86_64_SHA\"/" "$FORMULA"
-          sed -i "/$APP-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_ARM64_SHA\"/" "$FORMULA"
-          sed -i "/$APP-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$LINUX_X86_64_SHA\"/" "$FORMULA"
+          sed -i "s/version \".*\"/version \"$VERSION\"/" "$formula"
+          sed -i "s|download/[^/]*/|download/$TAG/|g" "$formula"
+          sed -i "/$APP-macos-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$arm64_sha\"/" "$formula"
+          sed -i "/$APP-macos-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$x86_64_sha\"/" "$formula"
+          sed -i "/$APP-linux-aarch64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$linux_arm64_sha\"/" "$formula"
+          sed -i "/$APP-linux-x86_64.tar.gz/,/sha256/ s/sha256 \".*\"/sha256 \"$linux_x86_64_sha\"/" "$formula"
+          if [ "$APP" = "omen" ]; then
+            sed -i 's/^  desc ".*"$/  desc "Encrypted, verifiable commit-reveal voting CLI"/' "$formula"
+          fi
 
       - name: Push updated formula
-        if: env.skip != 'true'
+        if: env.skip_formula != 'true'
+        shell: bash
+        env:
+          APP: ${{ needs.metadata.outputs.app }}
+          TAG: ${{ needs.metadata.outputs.tag }}
         run: |
+          set -euo pipefail
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/
-          git commit -m "Update ${{ steps.app.outputs.name }} formula for ${{ github.ref_name }}"
+          git add "Formula/$APP.rb"
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Formula/$APP.rb is already current; nothing to push."
+            exit 0
+          fi
+          git commit -m "Update $APP formula for $TAG"
           git push

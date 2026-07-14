@@ -4,10 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: Test (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -15,16 +22,114 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          version: 0.16.0
+          go-version-file: go.mod
+          cache: true
 
       - name: Check formatting
-        run: zig fmt --check build.zig build.zig.zon apps
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files need gofmt:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
 
-      - name: Build all apps
-        run: zig build
+      - name: Vet
+        run: go vet ./...
 
-      - name: Run tests
-        run: zig build test
+      - name: Static analysis
+        run: go tool staticcheck ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+  fuzz-smoke:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Frame decoder
+        run: go test ./internal/frame -run=^$ -fuzz=^FuzzRead$ -fuzztime=5s
+
+      - name: Mitt filename sanitizer
+        run: go test ./internal/mitt -run=^$ -fuzz=^FuzzSanitizeFilename$ -fuzztime=5s
+
+      - name: Covenant artifact verifier
+        run: go test ./internal/covenant -run=^$ -fuzz=^FuzzVerifyArtifact$ -fuzztime=5s
+
+      - name: Covenant roster decoder
+        run: go test ./internal/covenant -run=^$ -fuzz=^FuzzDecodeRoster$ -fuzztime=5s
+
+      - name: Omen artifact verifier
+        run: go test ./internal/omen -run=^$ -fuzz=^FuzzVerifyArtifact$ -fuzztime=5s
+
+      - name: Omen protocol decoders
+        run: go test ./internal/omen -run=^$ -fuzz=^FuzzProtocolDecoders$ -fuzztime=5s
+
+      - name: Seance nick-list decoder
+        run: go test ./internal/seance -run=^$ -fuzz=^FuzzParseNickList$ -fuzztime=5s
+
+  executable-integration:
+    name: Executable integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build release-shaped binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for app in mitt seance familiar omen covenant; do
+            CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=9.8.7" \
+              -o "dist/$app" "./cmd/$app"
+          done
+
+      - name: Drive real CLI workflows
+        env:
+          CAULDRON_EXPECT_VERSION: 9.8.7
+          CAULDRON_GO_MITT: ${{ github.workspace }}/dist/mitt
+          CAULDRON_GO_SEANCE: ${{ github.workspace }}/dist/seance
+          CAULDRON_GO_FAMILIAR: ${{ github.workspace }}/dist/familiar
+          CAULDRON_GO_OMEN: ${{ github.workspace }}/dist/omen
+          CAULDRON_GO_COVENANT: ${{ github.workspace }}/dist/covenant
+        run: go test -v -timeout=90s ./internal/itest
+
+  vulnerability-scan:
+    name: Weekly vulnerability scan
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Scan dependencies and reachable code
+        run: go tool govulncheck ./...

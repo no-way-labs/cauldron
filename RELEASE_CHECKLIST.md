@@ -1,80 +1,124 @@
-# Release Checklist
+# Release checklist
 
-Use this checklist when preparing and publishing a new release.
+Pushing an app tag runs `.github/workflows/release.yml`, which validates the
+tag, injects its bare semantic version into the binary, builds four static
+archives, publishes SHA-256 sidecars, and updates the corresponding formula in
+[`homebrew-cauldron`](https://github.com/no-way-labs/homebrew-cauldron).
 
-Releases are managed via GitHub Actions. Pushing a tag triggers the build + release workflow, which also auto-updates the app's Homebrew formula in [homebrew-cauldron](https://github.com/no-way-labs/homebrew-cauldron) (all five apps have formulas; the update step is skipped with a log message if a formula is ever missing).
+## Tag conventions
 
-## Tag Conventions
+| App | Tag format | Next Go-port line |
+|---|---|---|
+| mitt | `vMAJOR.MINOR.PATCH` | `v0.5.x` |
+| seance | `seance-vMAJOR.MINOR.PATCH` | `seance-v0.3.x` |
+| familiar | `familiar-vMAJOR.MINOR.PATCH` | `familiar-v0.3.x` |
+| omen | `omen-vMAJOR.MINOR.PATCH` | `omen-v0.2.x` |
+| covenant | `covenant-vMAJOR.MINOR.PATCH` | `covenant-v0.2.x` |
 
-| App | Tag format | Example |
-|-----|-----------|---------|
-| mitt | `v*` | `v0.5.0` |
-| seance | `seance-v*` | `seance-v0.2.8` |
-| familiar | `familiar-v*` | `familiar-v0.1.3` |
-| omen | `omen-v*` | `omen-v0.1.0` |
-| covenant | `covenant-v*` | `covenant-v0.1.0` |
+Tags must contain exactly three numeric components. Published tags are
+immutable: never move or reuse one.
 
-## Pre-Release
+## Before tagging
 
-- [ ] Zig **0.16.0** installed (`zig version`) — the build enforces `minimum_zig_version` via build.zig.zon
-- [ ] Bump `pub const version` in the app's `main.zig` to match the tag
-- [ ] Run tests: `zig build test`
-- [ ] Check formatting: `zig fmt --check build.zig build.zig.zon apps`
-- [ ] Cross-compile all release targets locally (comptime-gated OS branches are only analyzed for the target being built, so a native-only build can hide Linux breakage):
+- [ ] Install the Go version selected by `go.mod` (Go 1.26 or newer).
+- [ ] Review `CHANGELOG.md`, `README.md`, and `SECURITY.md` for the app's actual
+  behavior and known limitations.
+- [ ] If the Go toolchain or runtime module versions changed, update
+  `THIRD_PARTY_NOTICES` from their pinned upstream `LICENSE`/`PATENTS` files.
+- [ ] Confirm formatting and analysis:
+
   ```bash
-  zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
-  zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe
-  zig build -Dtarget=x86_64-linux -Doptimize=ReleaseSafe
-  zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
-  ```
-- [ ] Commit all changes to `main` branch and confirm the CI workflow is green
-
-## Release
-
-- [ ] Create and push the git tag (see tag conventions above):
-  ```bash
-  # Example for omen:
-  git tag -a omen-v0.X.Y -m "Release omen-v0.X.Y"
-  git push origin omen-v0.X.Y
+  test -z "$(gofmt -l .)"
+  go vet ./...
+  go tool staticcheck ./...
+  go tool govulncheck ./...
   ```
 
-- [ ] Wait for GitHub Actions to complete:
-  - [ ] Build workflow completes (4 platform binaries)
-  - [ ] Release is created with all binaries and SHA256 checksums
-  - [ ] Homebrew formula in `homebrew-cauldron` is auto-updated
+- [ ] Run the complete race suite and build every package:
 
-## Post-Release Verification
-
-- [ ] Verify GitHub Release page has all 4 tar.gz files and checksums
-- [ ] Verify Homebrew formula was updated:
   ```bash
-  # Check Formula/<app>.rb in homebrew-cauldron
-  # Version, URLs, and SHA256s should all match the new release
+  go test -race ./...
+  go build ./...
   ```
-- [ ] Test Homebrew installation:
+
+- [ ] Cross-compile the app for all release targets. Replace `APP` and
+  `VERSION`; the version is injected at link time and is not edited in source:
+
+  ```bash
+  APP=omen
+  VERSION=0.2.0
+  mkdir -p dist
+  for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
+    GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 \
+      go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+      -o "dist/$APP-${target%/*}-${target#*/}" "./cmd/$APP"
+  done
+  ./dist/$APP-linux-amd64 --version
+  ```
+
+- [ ] Inspect the app's actual Homebrew `test do` block in the external tap and
+  run the same assertions against the release candidate.
+- [ ] Before a seance tag, exercise the interactive editor on macOS Terminal
+  and a Linux terminal: arrows, Home/End, Delete/Backspace, Ctrl+U/A/E, Ctrl+C,
+  resize/redraw, and terminal restoration after exit.
+- [ ] Confirm CI is green on `main` and the working tree contains the intended
+  changes only.
+
+## Publish
+
+- [ ] Create and push an annotated immutable tag:
+
+  ```bash
+  git tag -a omen-v0.2.0 -m "Release omen-v0.2.0"
+  git push origin omen-v0.2.0
+  ```
+
+- [ ] Confirm the release workflow selected the correct app and bare version.
+- [ ] Confirm exactly four archives and four sidecars were uploaded, preserving
+  these spellings:
+
+  ```text
+  <app>-macos-aarch64.tar.gz
+  <app>-macos-x86_64.tar.gz
+  <app>-linux-aarch64.tar.gz
+  <app>-linux-x86_64.tar.gz
+  ```
+
+- [ ] Inspect an archive and confirm it contains the app binary, `LICENSE`, and
+  `THIRD_PARTY_NOTICES`.
+
+- [ ] Confirm the release notes contain the same SHA-256 values as the sidecars.
+- [ ] Confirm the matching Homebrew formula's version, URLs, all four hashes,
+  and MIT license metadata were updated and pushed. For Omen, also
+  confirm its description no longer claims anonymous voting.
+
+`workflow_dispatch` accepts an existing tag for retrying the workflow. It still
+checks out that immutable tag; it must not be used to release arbitrary branch
+state.
+
+## Post-release verification
+
+- [ ] Download one archive independently and verify its checksum.
+- [ ] Run `<app> --version` and a representative local-only flow.
+- [ ] Test the formula:
+
   ```bash
   brew update
-  brew upgrade <app>   # mitt, seance, familiar, omen, or covenant
+  brew upgrade <app>
+  brew test <app>
   ```
 
-## If Homebrew Formula Wasn't Updated
+- [ ] For protocol apps, run a compatibility smoke test with the previous
+  release where the v1 protocol promises interoperation.
 
-The CI needs a `HOMEBREW_TAP_TOKEN` secret (a PAT with repo scope for `homebrew-cauldron`). If the auto-update failed:
+## Formula recovery
 
-1. Download and calculate SHA256s:
-   ```bash
-   # Replace APP and TAG as needed (e.g., APP=omen TAG=omen-v0.1.0)
-   for target in macos-aarch64 macos-x86_64 linux-aarch64 linux-x86_64; do
-     curl -sL "https://github.com/no-way-labs/cauldron/releases/download/$TAG/$APP-$target.tar.gz" -o "$APP-$target.tar.gz"
-     shasum -a 256 "$APP-$target.tar.gz"
-   done
-   ```
+The workflow needs `HOMEBREW_TAP_TOKEN` with write access to the tap. If formula
+automation fails, calculate the four archive hashes from the immutable release,
+update `Formula/<app>.rb` manually, run `brew audit --strict <app>` and
+`brew test <app>`, then commit the tap change.
 
-2. Manually update the formula in `homebrew-cauldron/Formula/<app>.rb`
-3. Commit and push to homebrew-cauldron
+## Rollback
 
-## Adding a New App
-
-1. Add the tag pattern to `.github/workflows/release.yml` (trigger list, build matrix, and the "Determine app from tag" step)
-2. Create `Formula/<app>.rb` in homebrew-cauldron, modeled on an existing formula, pointed at the app's first release with real SHA256s (the workflow's sed-based updater fills subsequent releases automatically)
-3. Add the app to the tag table above
+Do not move the bad tag. Revert or fix the source and publish a new patch-version
+tag. Release and formula URLs must always continue to identify immutable bytes.
