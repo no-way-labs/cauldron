@@ -151,10 +151,13 @@ func TestWrongRoomKeyIsSilentlyRejected(t *testing.T) {
 		Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(int(server.Port()))),
 		Nick:    "alice", Timeout: time.Second, TimeoutSet: true,
 	}, &wrong, &joiner)
-	if err != nil {
-		t.Fatal(err)
+	// The server closes as soon as it cannot decrypt the JOIN. Depending on the
+	// TCP stack and scheduling, that close can reach the client during Connect's
+	// second write or during Run's first read. Both are successful rejection.
+	if err == nil {
+		_, err = client.Run(ctx)
 	}
-	if _, err := client.Run(ctx); err == nil {
+	if err == nil {
 		t.Fatal("wrong room key was admitted")
 	}
 	connected, keyed := server.Ready()
