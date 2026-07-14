@@ -169,7 +169,4 @@ cauldron/
 
 ## License
 
-The repository's historical license metadata conflicts: [LICENSE](LICENSE)
-contains GNU GPLv3, while the pre-port README and published Homebrew formulas
-identify the project as MIT. The Go port does not choose between or alter those
-terms. The repository owner must resolve the discrepancy before the next release.
+Cauldron is licensed under the [MIT License](LICENSE).

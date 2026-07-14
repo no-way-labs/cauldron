@@ -16,10 +16,10 @@ Notable changes to all Cauldron applications are recorded here.
   legacy Zig source tree.
 - Corrected all claims that omen v1 provides anonymous voting. Reveals are
   directly linkable to signed roster slots.
-- Flagged the pre-existing conflict between the GPLv3 `LICENSE` file and MIT
-  README/Homebrew metadata for owner resolution; the port does not silently
-  relicense the project. Release automation replaces Omen's stale anonymity
-  claim in its formula description.
+- Relicensed the project under MIT at the owner's direction, resolving the
+  pre-existing mismatch with the README and Homebrew formulas. Release
+  automation also replaces Omen's stale anonymity claim in its formula
+  description.
 
 ### Added
 

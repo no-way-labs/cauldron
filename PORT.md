@@ -1,8 +1,7 @@
 # Cauldron: Zig → Go Port Plan and Compatibility Record
 
 **Status:** Working-tree implementation complete 2026-07-13; tag/release rollout
-requires the owner license decision and operator checklist; retained as the
-compatibility/design record
+requires the operator checklist; retained as the compatibility/design record
 **Target toolchain:** Go 1.26 (current stable 1.26.5, 2026-07-07)
 **Scope:** All five apps (~11k lines of Zig), build system, CI, release automation
 **Canonical Zig baseline:** commit `d929c18` (the current source when this review was
@@ -32,8 +31,8 @@ compatibility testing; Phase 6 then removed the legacy source. The port preserve
   stdout/stderr split, so scripts and muscle memory keep working.
 - **Release compatibility** — same tag conventions, artifact names, and Homebrew
   formula structure; the tap automation keeps working while correcting Omen's
-  stale description. The pre-existing license metadata conflict is left for an
-  explicit owner decision rather than changed as part of a language port.
+  stale description. The project and existing formula metadata consistently use
+  the MIT license following the repository owner's decision.
 
 Motivation: Zig is pre-1.0 and its API churn is a recurring tax (the 0.15→0.16
 `std.Io` overhaul forced a repo-wide migration in July 2026), model/tooling support
@@ -800,10 +799,9 @@ run: |
 
 The metadata job rejects anything except the five documented tag forms and checks out
 that exact tag for both manual and push-triggered runs. The Linux/amd64 build executes
-`--version` before packaging. Each archive contains the app binary, the owner-resolved
-project `LICENSE`, and `THIRD_PARTY_NOTICES`; the added notice files do not change the
-archive name or formula install path. Release publication is also blocked while the
-license-conflict marker remains in README.
+`--version` before packaging. Each archive contains the app binary, the MIT project
+`LICENSE`, and `THIRD_PARTY_NOTICES`; the added notice files do not change the archive
+name or formula install path.
 
 The workflow uses a matrix mapping to preserve artifact spelling — **GOARCH says `arm64`/`amd64`
 but the tarballs must stay `aarch64`/`x86_64`** (the formulas and the sed step key on
@@ -828,14 +826,12 @@ avoids.
 **No structural changes.** Formulas already install prebuilt binaries from release
 tarballs; language is invisible to them. Each phase's release flows through the
 existing sed automation and replaces Omen's false "Anonymous" description. It does
-not mutate license metadata: the tracked GPLv3 license text conflicts with the
-historical README and all five MIT formula declarations, so only the repository owner
-can resolve that legal intent. `release.yml` and `RELEASE_CHECKLIST.md` block the next
-release on a consistent owner-approved choice. The formula `test do` blocks keep
-passing because CLI surfaces are preserved. Fetch and run the external tap's actual
-`test do` blocks in a release dry run; do not infer their expectations. Mitt retains
-the `--help` exit-1 quirk and gains a successful `--version` suitable for a formula
-smoke test.
+not mutate license metadata: the project `LICENSE`, README, and all five formula
+declarations consistently identify MIT. The formula `test do` blocks keep passing
+because CLI surfaces are preserved. Fetch and run the external tap's actual `test do`
+blocks in a release dry run; do not infer their expectations. Mitt retains the
+`--help` exit-1 quirk and gains a successful `--version` suitable for a formula smoke
+test.
 
 ## 12. Testing strategy
 

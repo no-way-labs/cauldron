@@ -23,10 +23,6 @@ immutable: never move or reuse one.
 - [ ] Install the Go version selected by `go.mod` (Go 1.26 or newer).
 - [ ] Review `CHANGELOG.md`, `README.md`, and `SECURITY.md` for the app's actual
   behavior and known limitations.
-- [ ] Obtain and record the repository owner's license decision: the tracked
-  GPLv3 `LICENSE` conflicts with the historical MIT README and Homebrew
-  formulas. Update all locations consistently; do not infer the answer in
-  release automation.
 - [ ] If the Go toolchain or runtime module versions changed, update
   `THIRD_PARTY_NOTICES` from their pinned upstream `LICENSE`/`PATENTS` files.
 - [ ] Confirm formatting and analysis:
@@ -93,7 +89,7 @@ immutable: never move or reuse one.
 
 - [ ] Confirm the release notes contain the same SHA-256 values as the sidecars.
 - [ ] Confirm the matching Homebrew formula's version, URLs, all four hashes,
-  and owner-approved license metadata were updated and pushed. For Omen, also
+  and MIT license metadata were updated and pushed. For Omen, also
   confirm its description no longer claims anonymous voting.
 
 `workflow_dispatch` accepts an existing tag for retrying the workflow. It still
