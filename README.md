@@ -1,94 +1,102 @@
 # Cauldron
 
-Encrypted CLI tools written in Zig. No accounts, no cloud, no history.
+Encrypted command-line tools written in Go. The peer-to-peer apps require no
+Cauldron account and run no hosted Cauldron service. Public sessions use the
+third-party `bore.pub` relay; local-only operation is available for every
+networked app. Familiar is optional and requires an Anthropic API account/key.
 
 ## Apps
 
-### mitt - encrypted file transfer
-One party opens a mitt (a publicly reachable inbox), others send files to it. Everything is end-to-end encrypted and tunneled through bore.
+### mitt — encrypted file transfer
+
+One person opens a temporary inbox and another sends a file, stdin, or literal
+text to it.
 
 ```bash
-# Receive files
+# Receive files (uses bore when available)
 mitt open
 
 # Send a file
 mitt send bore.pub:54321 file.txt --password fuzzy-planet-cat
+
+# Stay entirely on loopback
+mitt open --local --port 8080 --password local-test
 ```
 
-### seance - ephemeral encrypted group chat
-One person hosts a room, others join with a shared password. Messages are end-to-end encrypted and vanish when the room closes. Nothing touches disk.
+See the [mitt guide](docs/mitt.md) and [v1 wire protocol](docs/mitt-protocol.md).
+
+### seance — ephemeral encrypted group chat
+
+One person hosts a room and others join with its shared password. Messages are
+kept in memory and disappear when the processes exit.
 
 ```bash
-# Host a room
 seance host
-
-# Join a room
 seance join bore.pub:54321 --password fuzzy-planet-42
 
-# Join with an AI participant (Claude)
-seance join bore.pub:54321 --password fuzzy-planet-42 --familiar
-
-# Bot mode - HTTP API for programmatic access
+# Expose a loopback-only HTTP API for a bot
 seance join bore.pub:54321 --password fuzzy-planet-42 --bot --api-port 9999
+
+# Start the bundled Claude participant alongside that API
+seance join bore.pub:54321 --password fuzzy-planet-42 --familiar
 ```
 
-### omen - anonymous encrypted voting
-One person hosts a vote with a question and options, others join to cast ballots. Votes are committed, then revealed — every participant independently verifies the tally. Nothing touches disk unless you pipe the artifact.
+### omen — encrypted, verifiable voting
+
+Omen runs a commit-reveal vote. Participants verify signatures, commitment
+coverage, reveals, and the tally, and can save the result as a JSON artifact.
 
 ```bash
-# Host a vote
 omen host "What should we name the release?" --options alpha,beta,gamma
-
-# Join a vote
 omen join bore.pub:54321 --password misty-raven-42
 
-# Simple yes/no (default options)
-omen host "Ship today?"
-
-# Save the cryptographic proof artifact
-omen host "Ship today?" > result.json
-
-# Verify a saved artifact
+omen host "Ship today?" --output result.json
 omen verify result.json
 
-# Restrict voting to a covenant roster
+# Restrict the live vote to a strictly verified covenant roster
 omen host "Ship today?" --roster team.json --identity "my secret phrase"
 omen join bore.pub:54321 --password misty-raven-42 --identity "my secret phrase"
 ```
 
-**Security**: commit-reveal protocol with BLAKE2b commitments, Ed25519 signatures, and Fisher-Yates shuffled reveals. Every participant verifies all signatures, checks the bijection between reveals and commitments, and tallies independently, so the host cannot forge, alter, or drop a recorded vote without detection. Preventing ballot stuffing (a host or peer adding extra identities) additionally requires restricting the vote to a covenant roster with `--roster` — without it, anyone who has the room password can cast multiple ballots. `omen verify <file.json>` re-checks all of this offline. See [SECURITY.md](SECURITY.md) for the full threat model.
+Omen v1 is **not anonymous**. Every revealed vote can be matched to its signed
+commitment and therefore to a roster slot/public key. Shuffling the reveal order
+does not break that link. Without `--roster`, anyone with the room password can
+vote under multiple identities. A restricted live vote enforces a verified
+covenant, but the resulting v1 omen artifact does not itself prove which
+covenant supplied its roster. See [SECURITY.md](SECURITY.md).
 
-### covenant - membership signing ceremony
-One person hosts a signing ceremony for a group, others join with their identity passphrase. Everyone exchanges public keys and co-signs the roster. The output is a multi-signed JSON artifact proving mutual agreement on membership.
+### covenant — membership signing ceremony
+
+Participants derive Ed25519 identities from passphrases and co-sign one
+canonical membership roster.
 
 ```bash
-# Host a signing ceremony
-covenant host "Engineering Team" --identity "my secret phrase"
-
-# Join a ceremony
+covenant host "Engineering Team" --identity "my secret phrase" --output team.json
 covenant join bore.pub:54321 --password misty-raven-42 --identity "my secret phrase"
 
-# Verify a saved covenant
 covenant verify team.json
-
-# List members
 covenant members team.json
 ```
 
-**Security**: deterministic Ed25519 identity derived from your passphrase via Argon2id, mutual attestation (every member signs the same roster hash), tamper-evident (modifying any member invalidates all signatures). No files, no accounts — your identity lives in your memory. Choose a strong passphrase: it is the only thing between an attacker and your signing key.
+Choose strong identity passphrases and exchange public-key fingerprints through
+a trusted channel. Use `covenant members team.json` for the full keys; abbreviated
+console prefixes are not identity checks. A valid self-contained artifact proves
+control of its listed keys, not real-world identity.
 
-### familiar - AI chat bot for seance rooms
-Autonomous Claude-powered daemon that joins a seance room and responds to messages. Authenticates to the Claude API with an API key read from the `ANTHROPIC_API_KEY` environment variable (never written to disk, never passed on the command line).
+### familiar — Claude participant for seance
+
+Familiar polls a seance bot API and posts Claude responses. Its API key is read
+from `ANTHROPIC_API_KEY`, never from a command-line flag.
 
 ```bash
-# One-liner: seance spawns familiar automatically
+export ANTHROPIC_API_KEY=sk-ant-...
 seance join bore.pub:54321 --password fuzzy-planet-42 --familiar
 
-# Or run separately
+# Or, with a separately running `seance --bot` client:
 familiar --api-port 9999
 ```
 
-See [apps/familiar/README.md](apps/familiar/README.md) for configuration options.
+See the [familiar guide](docs/familiar.md).
 
 ## Installation
 
@@ -96,64 +104,72 @@ See [apps/familiar/README.md](apps/familiar/README.md) for configuration options
 
 ```bash
 brew tap no-way-labs/cauldron
-brew install mitt
-brew install seance
+brew install mitt seance familiar omen covenant
 ```
 
-### Prebuilt Binaries
+### Prebuilt binaries
 
-Download from [GitHub Releases](https://github.com/no-way-labs/cauldron/releases):
+Each [GitHub release](https://github.com/no-way-labs/cauldron/releases) contains
+macOS and Linux archives for arm64 (`aarch64`) and amd64 (`x86_64`), plus SHA-256
+sidecars. Archives also carry the project license and
+`THIRD_PARTY_NOTICES`. Releases are app-specific, so select the tag for the app
+you want.
+
+### From source
+
+Go 1.26 or newer is required.
 
 ```bash
-curl -L https://github.com/no-way-labs/cauldron/releases/latest/download/seance-linux-x86_64.tar.gz | tar xz
-./seance host
+git clone https://github.com/no-way-labs/cauldron.git
+cd cauldron
+INSTALL_DIR="$HOME/.local/bin" ./install.sh
 ```
 
-### From Source
-
-Requires **Zig 0.16.0**. Will not compile with 0.15.x or earlier (the codebase uses the 0.16 `std.Io` interface).
+For development:
 
 ```bash
-zig build
+go test -race ./...
+go build ./...
 ```
 
-Install all apps to `~/.local/bin`:
-```bash
-INSTALL_DIR=~/.local/bin ./install.sh
-```
+Hosts use the external [`bore`](https://github.com/ekzhang/bore) CLI to obtain a
+public relay address. If it is missing or unavailable, the apps report the
+failure and continue in local-only mode. Joiners and mitt senders do not need
+`bore`.
 
-## Security
+## Security summary
 
-All apps share the same cryptographic foundation:
+- XChaCha20-Poly1305 authenticated encryption with random 192-bit nonces.
+- Argon2id password derivation using 64 MiB, three iterations, and four lanes.
+- Ed25519 identities and signatures for omen and covenant.
+- Loopback-only listeners, bounded frames/artifacts, handshake deadlines, and
+  participant/rate limits.
+- Strict offline artifact verification that rejects duplicate JSON keys and
+  inconsistent counts, rosters, commitments, signatures, or tallies.
+- Best-effort clearing of sensitive byte slices. Go's runtime and garbage
+  collector make complete memory erasure impossible to guarantee.
 
-- **XChaCha20-Poly1305** authenticated encryption
-- **Argon2id** key derivation (64 MiB, 3 iterations), fail-closed — never downgrades to a weaker hash
-- Auto-generated passwords use the system CSPRNG (three words + a number)
-- Constant-time authentication tag and magic comparison
-- Memory zeroing of keys and plaintext after use
-- Servers listen on localhost only; traffic reaches them through the bore tunnel
-- No secrets on disk; `familiar` reads its API key from `ANTHROPIC_API_KEY`
+Passwords may be supplied through `MITT_PASSWORD`, `SEANCE_PASSWORD`,
+`OMEN_PASSWORD`, `OMEN_IDENTITY`, `COVENANT_PASSWORD`, and
+`COVENANT_IDENTITY`, avoiding exposure in shell history and process listings.
+Read [SECURITY.md](SECURITY.md) before relying on these tools for sensitive use.
 
-Secrets can be supplied via environment variables instead of command-line flags
-(where they would otherwise be visible in `ps` and shell history):
-`MITT_PASSWORD`, `SEANCE_PASSWORD`, `OMEN_PASSWORD` / `OMEN_IDENTITY`,
-`COVENANT_PASSWORD` / `COVENANT_IDENTITY`.
+## Repository layout
 
-See [SECURITY.md](SECURITY.md) for the threat model and known limitations.
-
-## Project Structure
-
-```
+```text
 cauldron/
-├── apps/
-│   ├── mitt/              # Encrypted file transfer
-│   ├── seance/            # Encrypted group chat
-│   ├── omen/              # Anonymous encrypted voting
-│   ├── covenant/          # Membership signing ceremony
-│   └── familiar/          # Claude chat bot for seance
-└── build.zig
+├── cmd/                 # five CLI entry points
+├── internal/            # protocols, crypto wrappers, servers, clients, and tests
+├── docs/                # app guides and stable protocol documentation
+├── testdata/compat/     # deterministic legacy-compatibility vectors
+├── PORT.md              # audited Zig-to-Go migration specification
+├── THIRD_PARTY_NOTICES  # notices shipped with release binaries
+└── install.sh
 ```
 
 ## License
 
-MIT
+The repository's historical license metadata conflicts: [LICENSE](LICENSE)
+contains GNU GPLv3, while the pre-port README and published Homebrew formulas
+identify the project as MIT. The Go port does not choose between or alter those
+terms. The repository owner must resolve the discrepancy before the next release.

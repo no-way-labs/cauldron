@@ -1,5 +1,7 @@
-.zig-cache/
-zig-out/
-*.o
-release-assets/
+/bin/
+/dist/
+/inbox/
+/release-assets/
+coverage.out
+*.test
 .DS_Store
